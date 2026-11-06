@@ -30,6 +30,10 @@
 #include <linux/dma-mapping.h>
 #include <linux/slab.h>
 #include <linux/reset.h>
+#include <linux/atomic.h>
+#include <linux/string.h>
+#include <linux/workqueue.h>
+#include <clocksource/arm_arch_timer.h>
 
 #include <linux/of_address.h>
 #include <linux/of_gpio.h>
@@ -58,6 +62,240 @@
 
 /**default retry times ****/
 #define SUNXI_DEF_RETRY_TIMES		6
+
+/* T3 sdc2/v4p5x: prepare in normal context for the later panic writer. */
+/* Dedicated 16 MiB log area in the previously confirmed board layout. */
+#define SUNXI_PSTORE_START_SECTOR	15237120U
+#define SUNXI_PSTORE_NR_SECTORS	32768U
+#define SUNXI_PSTORE_SECTOR_SIZE	512U
+#define SUNXI_PANIC_RETRY_MS	500U
+
+#define SUNXI_PANIC_R1_ERRORS \
+	(R1_OUT_OF_RANGE | R1_ADDRESS_ERROR | R1_BLOCK_LEN_ERROR | \
+	 R1_WP_VIOLATION | R1_CARD_IS_LOCKED | R1_COM_CRC_ERROR | \
+	 R1_ILLEGAL_COMMAND | R1_CARD_ECC_FAILED | R1_CC_ERROR | \
+	 R1_ERROR | R1_UNDERRUN | R1_OVERRUN | R1_SWITCH_ERROR)
+
+enum sunxi_mmc_panic_write_state {
+	UNPREPARED,
+	READY,
+	PAUSED,
+	STOPPED,
+};
+
+struct sunxi_mmc_panic_context {
+	struct sunxi_mmc_host *host;
+	struct mmc_card *card;
+	u32 timer_hz;
+	atomic_t writing;
+
+	struct delayed_work work;
+	enum sunxi_mmc_panic_write_state state;
+};
+
+static struct sunxi_mmc_panic_context sunxi_mmc_panic_ctx = {
+	.state = STOPPED,
+};
+static DEFINE_SPINLOCK(sunxi_mmc_panic_lock);
+
+/* Called by the worker, or after its synchronous cancellation, with state invalid. */
+static void sunxi_mmc_panic_clean(void)
+{
+	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
+	struct mmc_card *card = ctx->card;
+
+	ctx->card = NULL;
+	ctx->timer_hz = 0;
+	if (card) {
+		mmc_host_clk_release(ctx->host->mmc);
+		put_device(&card->dev);
+	}
+}
+
+static int sunxi_mmc_panic_match_card(struct device *dev, void *data)
+{
+	return dev->bus && !strcmp(dev->bus->name, "mmc");
+}
+
+/* The worker holds the card reference, host claim and clock reference. */
+static int sunxi_mmc_panic_prepare_card(struct mmc_card *card)
+{
+	struct mmc_host *mmc = card->host;
+	struct mmc_command cmd = { 0 };
+	int ret;
+
+	if (card != mmc->card || mmc_card_removed(card))
+		return -ENODEV;
+	if (mmc->ios.power_mode != MMC_POWER_ON || !mmc->ios.clock)
+		return -EHOSTDOWN;
+	if (!mmc_card_mmc(card) || !mmc_card_blockaddr(card) ||
+	    card->ext_csd.data_sector_size != SUNXI_PSTORE_SECTOR_SIZE ||
+	    (card->ext_csd.part_config & EXT_CSD_PART_CONFIG_ACC_MASK) ||
+	    (card->ext_csd.cache_ctrl & 1) ||
+	    mmc->ios.timing != MMC_TIMING_MMC_HS)
+		return -EOPNOTSUPP;
+	if (card->ext_csd.sectors <= SUNXI_PSTORE_START_SECTOR ||
+	    card->ext_csd.sectors - SUNXI_PSTORE_START_SECTOR <
+		SUNXI_PSTORE_NR_SECTORS)
+		return -ERANGE;
+
+	/* CMD13 checks readiness without writing to the log area. */
+	cmd.opcode = MMC_SEND_STATUS;
+	cmd.arg = (u32)card->rca << 16;
+	cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
+	ret = mmc_wait_for_cmd(mmc, &cmd, 0);
+	if (ret)
+		return ret;
+	if ((cmd.resp[0] & SUNXI_PANIC_R1_ERRORS) ||
+	    !(cmd.resp[0] & R1_READY_FOR_DATA) ||
+	    R1_CURRENT_STATE(cmd.resp[0]) != R1_STATE_TRAN)
+		return -EIO;
+
+	return 0;
+}
+
+static void sunxi_mmc_panic_prepare_work(struct work_struct *work)
+{
+	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
+	struct device *card_dev;
+	struct mmc_host *mmc;
+	struct mmc_card *card;
+	unsigned long flags;
+	u32 timer_hz;
+	int ret;
+
+	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
+	if (ctx->state != UNPREPARED) {
+		spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+		return;
+	}
+	mmc = ctx->host->mmc;
+	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+
+	sunxi_mmc_panic_clean();
+	timer_hz = arch_timer_get_rate();
+	if (!timer_hz) {
+		dev_warn(mmc_dev(mmc), "panic prepare needs the ARM arch timer\n");
+		return;
+	}
+	/* Cards are children of class_dev; device_find_child takes a reference. */
+	card_dev = device_find_child(mmc_classdev(mmc), NULL,
+				    sunxi_mmc_panic_match_card);
+	if (!card_dev)
+		goto retry;
+	card = mmc_dev_to_card(card_dev);
+	mmc_claim_host(mmc);
+	mmc_host_clk_hold(mmc);
+
+	ret = sunxi_mmc_panic_prepare_card(card);
+	if (ret)
+		goto release;
+
+	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
+	/* Suspend/remove can start while the worker waits for CMD13. */
+	if (ctx->state != UNPREPARED) {
+		spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+		goto release;
+	}
+	ctx->card = card;
+	ctx->timer_hz = timer_hz;
+	atomic_set(&ctx->writing, 0);
+	/* A panic reader checks READY, then smp_rmb(), before using fields. */
+	smp_wmb();
+	ctx->state = READY;
+	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+
+	/* Keep the card and clock references until unprepare. */
+	mmc_release_host(mmc);
+	dev_info(mmc_dev(mmc), "panic context ready\n");
+	return;
+
+release:
+	mmc_host_clk_release(mmc);
+	mmc_release_host(mmc);
+	put_device(card_dev);
+
+retry:
+	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
+	if (ctx->state == UNPREPARED)
+		schedule_delayed_work(&ctx->work,
+				     msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+}
+
+/* Called once by the target controller's probe; T3 uses CONFIG_ARM_ARCH_TIMER. */
+static void sunxi_mmc_panic_prepare(struct sunxi_mmc_host *host)
+{
+	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
+	ctx->host = host;
+	ctx->state = UNPREPARED;
+	INIT_DELAYED_WORK(&ctx->work, sunxi_mmc_panic_prepare_work);
+	schedule_delayed_work(&ctx->work,
+			     msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+}
+
+/* Called before changing the card/bus configuration, under the host claim. */
+static void sunxi_mmc_panic_invalidate(struct sunxi_mmc_host *host)
+{
+	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
+	if (ctx->host == host && ctx->state == READY) {
+		ctx->state = UNPREPARED;
+		/* Make invalidation visible before the following hardware changes. */
+		smp_mb();
+		schedule_delayed_work(&ctx->work, msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+	}
+	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+}
+
+/* Normal context, without a host claim. Only PAUSED or STOPPED is passed. */
+static void sunxi_mmc_panic_cancel(struct sunxi_mmc_host *host,
+				   enum sunxi_mmc_panic_write_state state)
+{
+	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
+	if (ctx->host != host) {
+		spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+		return;
+	}
+	ctx->state = state;
+	/* Invalidate before references are dropped or the device is powered off. */
+	smp_mb();
+	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+
+	/* Forbid requeue/publication first; wait and drop references outside lock. */
+	cancel_delayed_work_sync(&ctx->work);
+	sunxi_mmc_panic_clean();
+	if (state == STOPPED) {
+		spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
+		ctx->host = NULL;
+		spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+	}
+}
+
+#ifdef CONFIG_PM
+static void sunxi_mmc_panic_resume(struct sunxi_mmc_host *host)
+{
+	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
+	if (ctx->host == host) {
+		ctx->state = UNPREPARED;
+		schedule_delayed_work(&ctx->work,
+				     msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+	}
+	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+}
+#endif
 
 static void sunxi_mmc_regs_save(struct sunxi_mmc_host *host);
 static void sunxi_mmc_regs_restore(struct sunxi_mmc_host *host);
@@ -814,6 +1052,7 @@ static void sunxi_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 #if 0
     char *drv_type[] = { "B", "A", "C", "D" };
 #endif
+	sunxi_mmc_panic_invalidate(host);
 	BUG_ON(ios->bus_mode >= sizeof(bus_mode) / sizeof(bus_mode[0]));
 	BUG_ON(ios->power_mode >= sizeof(pwr_mode) / sizeof(pwr_mode[0]));
 	BUG_ON(ios->timing >= sizeof(timing) / sizeof(timing[0]));
@@ -999,6 +1238,8 @@ static void sunxi_mmc_enable_sdio_irq(struct mmc_host *mmc, int enable)
 static void sunxi_mmc_hw_reset(struct mmc_host *mmc)
 {
 	struct sunxi_mmc_host *host = mmc_priv(mmc);
+
+	sunxi_mmc_panic_invalidate(host);
 	mmc_writel(host, REG_HWRST, 0);
 	udelay(10);
 	mmc_writel(host, REG_HWRST, 1);
@@ -1032,6 +1273,9 @@ static int sunxi_mmc_signal_voltage_switch(struct mmc_host *mmc,
 		dev_dbg(mmc_dev(mmc), "disable signal voltage-switch\n");
 		return 0;
 	}
+
+	if (!IS_ERR(vqmmc))
+		sunxi_mmc_panic_invalidate(mmc_priv(mmc));
 
 	switch (ios->signal_voltage) {
 	case MMC_SIGNAL_VOLTAGE_330:
@@ -1192,6 +1436,10 @@ static void sunxi_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	u32 imask = 0;
 	u32 cmd_val = 0;
 	int ret;
+
+	/* CMD6 can change the hardware partition before ext_csd is updated. */
+	if (cmd->opcode == MMC_SWITCH)
+		sunxi_mmc_panic_invalidate(host);
 
 	/* Check for set_ios errors (should never happen) */
 	if (host->ferror) {
@@ -1840,6 +2088,10 @@ static int sunxi_mmc_probe(struct platform_device *pdev)
 
 	dev_info(&pdev->dev, "base:0x%p irq:%u\n", host->reg_base, host->irq);
 	platform_set_drvdata(pdev, mmc);
+	if (host->phy_index == 2 &&
+	    of_device_is_compatible(pdev->dev.of_node,
+				    "allwinner,sunxi-mmc-v4p5x"))
+		sunxi_mmc_panic_prepare(host);
 	return 0;
 
       error_free_dma:
@@ -1855,6 +2107,7 @@ static int sunxi_mmc_remove(struct platform_device *pdev)
 	struct mmc_host *mmc = platform_get_drvdata(pdev);
 	struct sunxi_mmc_host *host = mmc_priv(mmc);
 
+	sunxi_mmc_panic_cancel(host, STOPPED);
 	mmc_remove_host(mmc);
 	disable_irq(host->irq);
 	sunxi_mmc_reset_host(host);
@@ -1933,7 +2186,10 @@ static int sunxi_mmc_suspend(struct device *dev)
 	int ret = 0;
 
 	if (mmc) {
+		sunxi_mmc_panic_cancel(host, PAUSED);
 		ret = mmc_suspend_host(mmc);
+		if (ret)
+			sunxi_mmc_panic_resume(host);
 		if (!ret) {
 			if (!IS_ERR(mmc->supply.vdmmc)) {
 				ret = regulator_disable(mmc->supply.vdmmc);
@@ -2067,6 +2323,8 @@ static int sunxi_mmc_resume(struct device *dev)
 		}
 		/*sunxi_dump_reg(mmc);*/
 		ret = mmc_resume_host(mmc);
+		if (!ret)
+			sunxi_mmc_panic_resume(host);
 	}
 
 	return ret;
@@ -2090,6 +2348,7 @@ void sunxi_shutdown_mmc(struct platform_device *pdev)
 	struct mmc_host *mmc = platform_get_drvdata(pdev);
 	struct sunxi_mmc_host *host = mmc_priv(mmc);
 
+	sunxi_mmc_panic_cancel(host, STOPPED);
 	if (host->sunxi_mmc_shutdown) {
 		host->sunxi_mmc_shutdown(pdev);
 	}
