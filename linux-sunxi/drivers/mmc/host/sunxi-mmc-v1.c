@@ -47,6 +47,7 @@
 #include <linux/mmc/core.h>
 #include <linux/mmc/card.h>
 #include <linux/mmc/slot-gpio.h>
+#include <linux/mmc/sunxi-mmc-v1-panic.h>
 
 #include <linux/sys_config.h>
 
@@ -64,10 +65,6 @@
 #define SUNXI_DEF_RETRY_TIMES		6
 
 /* T3 sdc2/v4p5x: prepare normally, take over and write only in fatal panic. */
-/* Dedicated 16 MiB log area in the previously confirmed board layout. */
-#define SUNXI_PSTORE_START_SECTOR	15237120U
-#define SUNXI_PSTORE_NR_SECTORS	32768U
-#define SUNXI_PSTORE_SECTOR_SIZE	512U
 #define SUNXI_PANIC_RETRY_MS	500U
 
 #define SUNXI_PANIC_R1_ERRORS \
@@ -297,18 +294,6 @@ static void sunxi_mmc_panic_resume(struct sunxi_mmc_host *host)
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
 }
 #endif
-
-/*
- * Called by a log backend only for KMSG_DUMP_PANIC, after local IRQs are
- * disabled and other CPUs have stopped. Never resume ordinary MMC I/O.
- * sector is relative to the fixed log area (normally 0 for the first call).
- * bytes is the nonzero payload length; the last sector is zero-padded here.
- * buf need not be word-aligned. Success is 0, failure is negative errno;
- * a failed call may already have written earlier sectors. Successful calls
- * share one takeover; after failure the next call checks takeover again.
- * prepare only arms this entry point: probe/worker/notifier do not call it.
- */
-int sunxi_mmc_panic_write(u32 sector, const void *buf, size_t bytes);
 
 #ifdef CONFIG_ARM_ARCH_TIMER
 #define SUNXI_PANIC_FIFO_OFF	0x200
@@ -2097,6 +2082,15 @@ static struct mmc_host_ops sunxi_mmc_ops = {
 	.card_busy = sunxi_mmc_card_busy,
 };
 
+bool sunxi_mmc_v1_panic_target(struct mmc_host *mmc)
+{
+	struct sunxi_mmc_host *host = mmc_priv(mmc);
+
+	return mmc->ops == &sunxi_mmc_ops && host->phy_index == 2 &&
+	       of_device_is_compatible(mmc_dev(mmc)->of_node,
+				       "allwinner,sunxi-mmc-v4p5x");
+}
+
 #if defined(MMC_FPGA) && defined(CONFIG_ARCH_SUN8IW10P1)
 void disable_card2_dat_det(void)
 {
@@ -2567,17 +2561,17 @@ static int sunxi_mmc_probe(struct platform_device *pdev)
 	ret = mmc_create_sys_fs(host, pdev);
 	if (ret) {
 		dev_err(&pdev->dev, "create sys fs failed\n");
-		goto error_free_dma;
+		goto error_remove_host;
 	}
 
 	dev_info(&pdev->dev, "base:0x%p irq:%u\n", host->reg_base, host->irq);
 	platform_set_drvdata(pdev, mmc);
-	if (host->phy_index == 2 &&
-	    of_device_is_compatible(pdev->dev.of_node,
-				    "allwinner,sunxi-mmc-v4p5x"))
+	if (sunxi_mmc_v1_panic_target(mmc))
 		sunxi_mmc_panic_prepare(host);
 	return 0;
 
+      error_remove_host:
+	mmc_remove_host(mmc);
       error_free_dma:
 	dma_free_coherent(&pdev->dev, SUNXI_REQ_PAGE_SIZE, host->sg_cpu,
 			  host->sg_dma);

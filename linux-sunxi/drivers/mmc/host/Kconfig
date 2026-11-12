@@ -584,6 +584,16 @@ config MMC_SUNXI
 	  If you have a board based on such a SoC and with a SD/MMC slot,
 	  say Y or M here.
 
+config MMC_SUNXI_PANIC_LOG
+	bool "Save the last kernel panic to the T3 eMMC log partition"
+	depends on MMC_SUNXI=y && MMC_BLOCK=y && ARCH_SUN8IW11P1
+	depends on ARM_ARCH_TIMER && PRINTK
+	select CRC32
+	help
+	  Use the sunxi-mmc-v1 driver and save one panic log in the
+	  dedicated sdc2 eMMC user-area partition 4. The partition must
+	  start at sector 15237120 and span 32768 sectors of 512 bytes.
+	  Reserve it exclusively for panic logs in the board image.
 
 config MMC_JZ4740
 	tristate "JZ4740 SD/Multimedia Card Interface support"

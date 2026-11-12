@@ -43,6 +43,7 @@
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
+#include <linux/mmc/sunxi-mmc-v1-panic.h>
 
 #include <asm/uaccess.h>
 
@@ -2411,6 +2412,7 @@ static int mmc_blk_probe(struct mmc_card *card)
 		if (mmc_add_disk(part_md))
 			goto out;
 	}
+	sunxi_mmc_panic_log_add(card, md->disk);
 	return 0;
 
  out:
@@ -2423,6 +2425,7 @@ static void mmc_blk_remove(struct mmc_card *card)
 {
 	struct mmc_blk_data *md = mmc_get_drvdata(card);
 
+	sunxi_mmc_panic_log_remove(card);
 	mmc_blk_remove_parts(card, md);
 	mmc_claim_host(card->host);
 	mmc_blk_part_switch(card, md);

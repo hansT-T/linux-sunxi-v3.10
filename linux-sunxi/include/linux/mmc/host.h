@@ -378,6 +378,10 @@ struct mmc_host {
 
 	unsigned int		slotno;	/* used for sdio acpi binding */
 
+#ifdef CONFIG_MMC_SUNXI_PANIC_LOG
+	int			hw_reset_cnt;	/* sunxi-mmc-v1 diagnostic counter */
+#endif
+
 #ifdef CONFIG_MMC_EMBEDDED_SDIO
 	struct {
 		struct sdio_cis			*cis;
