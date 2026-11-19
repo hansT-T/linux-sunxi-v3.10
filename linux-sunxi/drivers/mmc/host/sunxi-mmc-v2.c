@@ -67,6 +67,8 @@
 #include <linux/irqflags.h>
 #include <linux/kmsg_dump.h>
 #include <asm/byteorder.h>
+#include <linux/bio.h>
+#include <linux/workqueue.h>
 
 /**default retry times ****/
 #define SUNXI_DEF_RETRY_TIMES		6
@@ -103,15 +105,17 @@
 	(SDXC_IDMAC_RECEIVE_INTERRUPT | SDXC_IDMAC_TRANSMIT_INTERRUPT | SDXC_IDMAC_NORMAL_INTERRUPT_SUM)
 
 #define SUNXI_PANIC_LOG_MAGIC			0x434d4d50
-#define SUNXI_PANIC_LOG_VERSION			1
+#define SUNXI_PANIC_LOG_VERSION			2
 #define SUNXI_PANIC_LOG_WRITING			1
 #define SUNXI_PANIC_LOG_COMMITTED		2
-#define SUNXI_PANIC_LOG_SLOTS			64
-#define SUNXI_PANIC_LOG_SLOT_SECTORS \
-	(SUNXI_PSTORE_NR_SECTORS / SUNXI_PANIC_LOG_SLOTS)
 #define SUNXI_PANIC_LOG_PAYLOAD_MAX		(128 * 1024)
 #define SUNXI_PANIC_LOG_OPEN_MODE		(FMODE_READ | FMODE_EXCL)
 #define SUNXI_MMC_LOG_PARTNO			4
+#define SUNXI_PANIC_LOG_SLOTS			64
+#define SUNXI_PANIC_LOG_SLOT_SECTORS	(SUNXI_PSTORE_NR_SECTORS / SUNXI_PANIC_LOG_SLOTS)
+
+
+
 
 enum sunxi_mmc_panic_context_state {
 	UNPREPARED,
@@ -254,17 +258,22 @@ static void sunxi_mmc_panic_prepare(struct sunxi_mmc_host *host)
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
 }
 
-static void sunxi_mmc_panic_invalidate(struct sunxi_mmc_host *host)
+static void sunxi_mmc_panic_invalidate(struct sunxi_mmc_host *host, const char *caller, u32 arg)
 {
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
 	unsigned long flags;
+	bool invalidated = false;
 	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
 	if (ctx->host == host && ctx->state == READY){
 		ctx->state = UNPREPARED;
 		smp_mb();
 		schedule_delayed_work(&ctx->work, msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+		invalidated = true;
 	}
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+	if (invalidated) {
+		dev_info(mmc_dev(host->mmc), "panic prepare invalidated by %s arg=0x%08x\n", caller, arg);
+	}
 }
 
 static void sunxi_mmc_panic_cancel(struct sunxi_mmc_host *host, enum sunxi_mmc_panic_context_state state)
@@ -358,7 +367,8 @@ static int sunxi_mmc_panic_write_sector(struct sunxi_mmc_panic_context *ctx, u32
 	size_t offset;
 	unsigned int words = 0;
 	int ret;
-
+	//读取阈值寄存器并关闭卡侧读阈值功能，开启写阈值功能，并设置阈值为512字节
+	//让控制器等到FIFO中达到512字节阈值后再开始传输
 	thld = readl(host->reg_base + SUNXI_PANIC_THLD_OFF);
 	thld &= ~(0xfff << 16);
 	thld |= (512 << 16);
@@ -626,9 +636,12 @@ static int sunxi_mmc_panic_takeover(struct sunxi_mmc_panic_context *ctx)
 	mmc_writel(host, REG_IDIE, 0);
 	mmc_writel(host, REG_GCTRL, gctrl & ~SDXC_INTERRUPT_ENABLE_BIT);
 	if (host->mrq) {
+		printk(KERN_ERR "sunxi mmc panic: mrq is not NULL\n");
 		ret = sunxi_mmc_panic_wait_pending(ctx, &pending);
-		if (ret == -EAGAIN)
+		if (ret == -EAGAIN) {
+			printk(KERN_ERR "sunxi mmc panic: stop mrq\n");
 			ret = sunxi_mmc_panic_abort(ctx, &pending);
+		}
 		if (ret)
 			return ret;
 		sunxi_mmc_panic_disable_dma(host);
@@ -716,6 +729,9 @@ static u32 sunxi_panic_log_first_slot;
 static u32 sunxi_panic_log_first_seq;
 static atomic_t sunxi_panic_log_writes;
 static char sunxi_panic_log_payload[SUNXI_PANIC_LOG_PAYLOAD_MAX];
+static char sunxi_oops_log_payload[SUNXI_PANIC_LOG_PAYLOAD_MAX];
+static size_t sunxi_oops_log_len;
+static unsigned long sunxi_oops_log_busy;
 
 static u32 sunxi_panic_log_crc32(const void *data, size_t len)
 {
@@ -727,7 +743,6 @@ static int sunxi_panic_log_find_start(struct block_device *partition)
 	u32 slot;
 	int latest_slot = -1;
 	u32 latest_seq = 0;
-
 	for (slot = 0; slot < SUNXI_PANIC_LOG_SLOTS; slot++) {
 		struct sunxi_panic_log_header header;
 		u32 sector = slot * SUNXI_PANIC_LOG_SLOT_SECTORS;
@@ -735,40 +750,72 @@ static int sunxi_panic_log_find_start(struct block_device *partition)
 		Sector page;
 		u32 crc;
 		u32 seq;
-
 		data = read_dev_sector(partition, sector, &page);
-		if (!data)
+		if (!data) {
+			printk(KERN_ERR "sunxi panic log: sector destoryed, can't read sector\n");
 			return -EIO;
+		}
 		memcpy(&header, data, sizeof(header));
 		put_dev_sector(page);
-
-		if (header.magic != cpu_to_le32(SUNXI_PANIC_LOG_MAGIC) ||
-		    header.version != cpu_to_le32(SUNXI_PANIC_LOG_VERSION) ||
-		    header.header_len != cpu_to_le32(sizeof(header)) ||
-		    header.state != cpu_to_le32(SUNXI_PANIC_LOG_COMMITTED))
+		if (header.magic != cpu_to_le32(SUNXI_PANIC_LOG_MAGIC) || 
+			header.version != cpu_to_le32(SUNXI_PANIC_LOG_VERSION) ||
+			header.header_len != cpu_to_le32(sizeof(header)) || 
+			header.state != cpu_to_le32(SUNXI_PANIC_LOG_COMMITTED)) {
 			continue;
-
+		}
 		crc = le32_to_cpu(header.header_crc);
 		header.header_crc = 0;
-		if (crc != sunxi_panic_log_crc32(&header, sizeof(header)))
+		if (crc != sunxi_panic_log_crc32(&header, sizeof(header))) {
 			continue;
-
+		}
 		seq = le32_to_cpu(header.seq);
-		if (latest_slot >= 0 && (s32)(seq - latest_seq) <= 0)
+		if (latest_slot >= 0 && (s32)(seq - latest_seq) <= 0){
 			continue;
-		latest_slot = slot;
+		}
 		latest_seq = seq;
+		latest_slot = slot;
 	}
-
 	sunxi_panic_log_first_slot = (latest_slot + 1) % SUNXI_PANIC_LOG_SLOTS;
 	sunxi_panic_log_first_seq = latest_seq + 1;
 	atomic_set(&sunxi_panic_log_writes, 0);
+	printk(KERN_INFO "sunxi panic log: found start at slot %d, sequence %u\n", sunxi_panic_log_first_slot, sunxi_panic_log_first_seq);
 	return 0;
 }
 
-static int sunxi_panic_log_write_header(u32 sector,
-					struct sunxi_panic_log_header *header,
-					u32 state)
+struct sunxi_oops_log_io {
+	struct page *page;
+	struct bio *bio;
+};
+
+static int sunxi_crash_log_write(struct sunxi_oops_log_io *io, u32 sector, const void *data, size_t len)
+{
+	const char *src = data;
+	struct bio *bio;
+	char *buf;
+	int ret;
+
+	if (!io)
+		return sunxi_mmc_panic_write(sector, data, len);
+	bio = io->bio;
+	buf = page_address(io->page);
+	while (len) {
+		size_t bytes = min_t(size_t, len, SUNXI_PSTORE_SECTOR_SIZE);
+		memcpy(buf, src, bytes);
+		memset(buf + bytes, 0, SUNXI_PSTORE_SECTOR_SIZE - bytes);
+		bio_reset(bio);
+		bio->bi_bdev = sunxi_panic_log_partition;
+		bio->bi_sector = sector++;
+		bio_add_page(bio, io->page, SUNXI_PSTORE_SECTOR_SIZE, 0);
+		ret = submit_bio_wait(WRITE, bio);
+		if (ret) 
+			return ret;
+		src += bytes;
+		len -= bytes;
+	}
+	return 0;
+}
+
+static void sunxi_panic_log_set_state(struct sunxi_panic_log_header *header, u32 state)
 {
 	u32 crc;
 
@@ -776,59 +823,117 @@ static int sunxi_panic_log_write_header(u32 sector,
 	header->header_crc = 0;
 	crc = sunxi_panic_log_crc32(header, sizeof(*header));
 	header->header_crc = cpu_to_le32(crc);
-	return sunxi_mmc_panic_write(sector, header, sizeof(*header));
 }
 
-static void sunxi_panic_log_dump(struct kmsg_dumper *dumper, enum kmsg_dump_reason reason)
+static void sunxi_panic_log_write_record(const char *payload, size_t len, struct sunxi_oops_log_io *io)
 {
 	struct sunxi_panic_log_header header;
-	u32 index;
-	u32 slot;
-	u32 sector;
-	u32 seq;
-	u32 crc;
-	size_t len;
+	u32 index, slot, sector, seq;
+	int ret;
 
-	if (reason != KMSG_DUMP_PANIC || !irqs_disabled() || num_online_cpus() != 1) {
-		printk(KERN_ERR "sunxi panic log: not dumping panic log\n");
-		return;
-	}
-	if (!kmsg_dump_get_buffer(dumper, true, sunxi_panic_log_payload, 
-									sizeof(sunxi_panic_log_payload), &len) || !len) {
-		printk(KERN_ERR "sunxi panic log: failed to get buffer\n");
-		return;
-	}
 	index = (u32)atomic_inc_return(&sunxi_panic_log_writes) - 1;
-	slot = (sunxi_panic_log_first_slot + index) % SUNXI_PANIC_LOG_SLOTS;
-	sector = slot * SUNXI_PANIC_LOG_SLOT_SECTORS;
+	slot = (index + sunxi_panic_log_first_slot) % SUNXI_PANIC_LOG_SLOTS;
 	seq = sunxi_panic_log_first_seq + index;
+	sector = slot * SUNXI_PANIC_LOG_SLOT_SECTORS;
 
 	header.magic = cpu_to_le32(SUNXI_PANIC_LOG_MAGIC);
 	header.version = cpu_to_le32(SUNXI_PANIC_LOG_VERSION);
 	header.header_len = cpu_to_le32(sizeof(header));
 	header.payload_len = cpu_to_le32(len);
-	crc = sunxi_panic_log_crc32(sunxi_panic_log_payload, len);
-	header.payload_crc = cpu_to_le32(crc);
+	header.payload_crc = cpu_to_le32(sunxi_panic_log_crc32(payload, len));
 	header.seq = cpu_to_le32(seq);
 
-	if (sunxi_panic_log_write_header(sector, &header,
-					 SUNXI_PANIC_LOG_WRITING)) {
-		printk(KERN_ERR "sunxi panic log: failed to write header\n");
+	sunxi_panic_log_set_state(&header, SUNXI_PANIC_LOG_WRITING);
+	ret = sunxi_crash_log_write(io, sector, &header, sizeof(header));
+	if (ret) {
+		pr_err("sunxi crash  log: failed to write header: %d\n", ret);
 		return;
+	}
+	ret = sunxi_crash_log_write(io, sector + 1, payload, len);
+	if (ret) {
+		pr_err("sunxi crash log: failed to write payload: %d\n", ret);
+		return;
+	}
+	sunxi_panic_log_set_state(&header, SUNXI_PANIC_LOG_COMMITTED);
+	ret = sunxi_crash_log_write(io, sector, &header, sizeof(header));
+	if (ret) {
+		pr_err("sunxi crash log: failed to update header state: %d\n", ret);
+		return;
+	}
+	pr_info("sunxi crash log: successfully written\n");
+}
+
+static void sunxi_oops_log_worker(struct work_struct *work)
+{
+	struct block_device *partition = sunxi_panic_log_partition;
+	struct sunxi_oops_log_io io;
+	
+	if (bdev_read_only(partition)) {
+		pr_err("sunxi crash log: partition is read-only\n");
+		goto unlock;
+	}
+	if (sunxi_panic_log_card->ext_csd.cache_ctrl) {
+		pr_err("sunxi crash log: oops write requires disabled eMMC cache\n");
+		goto unlock;
 	}
 
-	if (sunxi_mmc_panic_write(sector + 1, sunxi_panic_log_payload, len)) {
-		printk(KERN_ERR "sunxi panic log: failed to write payload\n");
+	io.page = alloc_page(GFP_NOIO);
+	if (!io.page) {
+		pr_err("sunxi crash log: failed to allocate page\n");
+		goto unlock;
+	}
+	io.bio = bio_alloc(GFP_NOIO, 1);
+	sunxi_panic_log_write_record(sunxi_oops_log_payload, sunxi_oops_log_len, &io);
+	invalidate_bdev(partition);
+	bio_put(io.bio);
+	__free_page(io.page);
+unlock:
+	clear_bit_unlock(0, &sunxi_oops_log_busy);
+}
+
+static DECLARE_WORK(sunxi_oops_log_work, sunxi_oops_log_worker);
+
+static void sunxi_panic_log_dump(struct kmsg_dumper *dumper, enum kmsg_dump_reason reason)
+{
+	struct kmsg_dumper cursor = { .active = true };
+	char *payload;
+	size_t len;
+
+	if (reason != KMSG_DUMP_PANIC && reason != KMSG_DUMP_OOPS)
+		return;
+	if (reason == KMSG_DUMP_PANIC) {
+		if (!irqs_disabled() || num_online_cpus() != 1) {
+			pr_err("sunxi panic log: not dumping panic log\n");
+			return;
+		}
+		payload = sunxi_panic_log_payload;
+	} else {
+		if (test_and_set_bit_lock(0, &sunxi_oops_log_busy)) {
+			pr_err("sunxi panic log: oops log already in progress\n");
+			return;
+		}
+		payload = sunxi_oops_log_payload;
+	}
+	kmsg_dump_rewind(&cursor);
+	if (!kmsg_dump_get_buffer(&cursor, true, payload, SUNXI_PANIC_LOG_PAYLOAD_MAX, &len) || !len) {
+		if (reason == KMSG_DUMP_PANIC) {
+			pr_err("sunxi panic log: no panic log to dump\n");
+		} else {
+			clear_bit_unlock(0, &sunxi_oops_log_busy);
+		}
 		return;
 	}
-	if (sunxi_panic_log_write_header(sector, &header,
-					 SUNXI_PANIC_LOG_COMMITTED))
-		pr_err("sunxi panic log: failed to commit header\n");
+	if (reason == KMSG_DUMP_PANIC) {
+		sunxi_panic_log_write_record(sunxi_panic_log_payload, len, NULL);
+	} else {
+		sunxi_oops_log_len = len;
+		queue_work(system_freezable_wq, &sunxi_oops_log_work);
+	}
 }
 
 static struct kmsg_dumper sunxi_panic_log_dumper = {
 	.dump = sunxi_panic_log_dump,
-	.max_reason = KMSG_DUMP_PANIC,
+	.max_reason = KMSG_DUMP_OOPS,
 };
 
 void sunxi_mmc_panic_log_add(struct mmc_card *card, struct gendisk *disk)
@@ -855,16 +960,23 @@ void sunxi_mmc_panic_log_add(struct mmc_card *card, struct gendisk *disk)
 			dev_err(&card->dev, "panic log partition mismatch\n");
 			goto release;
 	}
-	ret = sunxi_panic_log_find_start(partition);
-	if (ret) {
-		dev_err(&card->dev, "panic log slot scan failed: %d\n", ret);
+	if (bdev_logical_block_size(partition) != SUNXI_PSTORE_SECTOR_SIZE) {
+		dev_err(&card->dev, "panic log requires 512-byte sector\n");
 		goto release;
 	}
-	ret = kmsg_dump_register(&sunxi_panic_log_dumper);
-	if (ret) 
+	ret = sunxi_panic_log_find_start(partition);
+	if (ret) {
+		dev_err(&card->dev, "failed to find start sector for panic log: %d\n", ret);
 		goto release;
+	}
 	sunxi_panic_log_card = card;
 	sunxi_panic_log_partition = partition;
+	ret = kmsg_dump_register(&sunxi_panic_log_dumper);
+	if (ret) {
+		sunxi_panic_log_card = NULL;
+		sunxi_panic_log_partition = NULL;
+		goto release;
+	}
 	dev_info(&card->dev, "panic logger registered\n");
 	return;
 release:
@@ -876,6 +988,8 @@ void sunxi_mmc_panic_log_remove(struct mmc_card *card)
 	if (card != sunxi_panic_log_card)
 		return;
 	kmsg_dump_unregister(&sunxi_panic_log_dumper);
+	cancel_work_sync(&sunxi_oops_log_work);
+	clear_bit_unlock(0, &sunxi_oops_log_busy);
 	blkdev_put(sunxi_panic_log_partition, SUNXI_PANIC_LOG_OPEN_MODE);
 	sunxi_panic_log_card = NULL;
 	sunxi_panic_log_partition = NULL;
@@ -1641,7 +1755,7 @@ static void sunxi_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 #if 0
     char *drv_type[] = { "B", "A", "C", "D" };
 #endif
-	sunxi_mmc_panic_invalidate(host);
+	sunxi_mmc_panic_invalidate(host, __func__, 0);
 	BUG_ON(ios->bus_mode >= sizeof(bus_mode) / sizeof(bus_mode[0]));
 	BUG_ON(ios->power_mode >= sizeof(pwr_mode) / sizeof(pwr_mode[0]));
 	BUG_ON(ios->timing >= sizeof(timing) / sizeof(timing[0]));
@@ -1827,7 +1941,7 @@ static void sunxi_mmc_enable_sdio_irq(struct mmc_host *mmc, int enable)
 static void sunxi_mmc_hw_reset(struct mmc_host *mmc)
 {
 	struct sunxi_mmc_host *host = mmc_priv(mmc);
-	sunxi_mmc_panic_invalidate(host);
+	sunxi_mmc_panic_invalidate(host, __func__, 0);
 	mmc_writel(host, REG_HWRST, 0);
 	udelay(10);
 	mmc_writel(host, REG_HWRST, 1);
@@ -1863,7 +1977,7 @@ static int sunxi_mmc_signal_voltage_switch(struct mmc_host *mmc,
 	}
 
 	if (!IS_ERR(vqmmc))
-		sunxi_mmc_panic_invalidate(mmc_priv(mmc));
+		sunxi_mmc_panic_invalidate(mmc_priv(mmc), __func__, 0);
 
 
 	switch (ios->signal_voltage) {
@@ -2027,7 +2141,7 @@ static void sunxi_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	int ret;
 
 	if (cmd->opcode == MMC_SWITCH)
-		sunxi_mmc_panic_invalidate(host);
+		sunxi_mmc_panic_invalidate(host, __func__, cmd->arg);
 
 	/* Check for set_ios errors (should never happen) */
 	if (host->ferror) {
