@@ -167,6 +167,14 @@ static struct sunxi_mmc_panic_context sunxi_mmc_panic_ctx = {
 
 static DEFINE_SPINLOCK(sunxi_mmc_panic_lock);
 
+#ifdef CONFIG_DEBUG_FS
+static unsigned int panic_dma_test_lba;
+static struct mmc_request *sunxi_mmc_dma_test_mrq;
+module_param(panic_dma_test_lba, uint, 0600);
+MODULE_PARM_DESC(panic_dma_test_lba,
+		 "One-shot panic test with IDMAC stalled during CMD25 (0 disables)");
+#endif
+
 static void sunxi_mmc_panic_clean(void)
 {
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
@@ -1337,6 +1345,17 @@ static int sunxi_mmc_init_host(struct mmc_host *mmc)
 	return 0;
 }
 
+#ifdef CONFIG_DEBUG_FS
+static void sunxi_mmc_dma_test_prepare_desc(const struct mmc_data *data,
+					   struct sunxi_idma_des *first)
+{
+	struct mmc_request *test_mrq = ACCESS_ONCE(sunxi_mmc_dma_test_mrq);
+
+	if (test_mrq && data->mrq == test_mrq)
+		first->config &= ~SDXC_IDMAC_DES0_OWN;
+}
+#endif
+
 static void sunxi_mmc_init_idma_des(struct sunxi_mmc_host *host,
 				    struct mmc_data *data)
 {
@@ -1356,6 +1375,9 @@ static void sunxi_mmc_init_idma_des(struct sunxi_mmc_host *host,
 	pdes[0].config |= SDXC_IDMAC_DES0_FD;
 	pdes[i - 1].config |= SDXC_IDMAC_DES0_LD;
 	pdes[i - 1].config &= ~SDXC_IDMAC_DES0_DIC;
+#ifdef CONFIG_DEBUG_FS
+	sunxi_mmc_dma_test_prepare_desc(data, pdes);
+#endif
 
 	/*
      * **Avoid the io-store starting the idmac hitting io-mem before the
@@ -2347,6 +2369,7 @@ static void sunxi_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	struct mmc_data *data = mrq->data;
 	unsigned long iflags;
 	bool wait_dma = false;
+	bool dma_test = false;
 	u32 imask = 0;
 	u32 cmd_val = 0;
 	int ret;
@@ -2395,14 +2418,65 @@ static void sunxi_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	}
 
 	if (data) {
+#ifdef CONFIG_DEBUG_FS
+		dma_test = cmd->opcode == MMC_WRITE_MULTIPLE_BLOCK && cmd->arg &&
+			   (data->flags & MMC_DATA_WRITE) &&
+			   ACCESS_ONCE(panic_dma_test_lba) == cmd->arg &&
+			   ACCESS_ONCE(sunxi_mmc_panic_ctx.state) == READY &&
+			   ACCESS_ONCE(sunxi_mmc_panic_ctx.host) == host &&
+			   cmpxchg(&panic_dma_test_lba, cmd->arg, 0U) == cmd->arg;
+		if (dma_test)
+			ACCESS_ONCE(sunxi_mmc_dma_test_mrq) = mrq;
+#endif
 		spin_unlock_irqrestore(&host->lock, iflags);
 		sunxi_mmc_set_dat(host , mmc , data);
+#ifdef CONFIG_DEBUG_FS
+		if (dma_test)
+			ACCESS_ONCE(sunxi_mmc_dma_test_mrq) = NULL;
+#endif
 		spin_lock_irqsave(&host->lock, iflags);
 	}
 
 	host->mrq = mrq;
 	host->wait_dma = wait_dma;
-	sunxi_mmc_exe_cmd(host, cmd , cmd_val , imask);
+	if (!dma_test) {
+		sunxi_mmc_exe_cmd(host, cmd, cmd_val, imask);
+	}
+#ifdef CONFIG_DEBUG_FS
+	else {
+		struct sunxi_idma_des *desc = host->sg_cpu;
+		u32 lba = cmd->arg;
+		u32 idie = mmc_readl(host, REG_IDIE);
+		u32 idst = 0;
+		unsigned int i;
+
+		mmc_writel(host, REG_IDIE, 0);
+		sunxi_mmc_exe_cmd(host, cmd, cmd_val, 0);
+		for (i = 0; i < 1000; i++) {
+			idst = mmc_readl(host, REG_IDST);
+			if ((idst & SUNXI_PANIC_DMA_STATE) == SDXC_IDMAC_SUSPEND) {
+				spin_unlock(&host->lock);
+				panic("sunxi dumper: test IDMAC suspended during CMD25 lba=%u idst=%08x",
+				      lba, idst);
+			}
+			udelay(1);
+		}
+
+		/* Allow the write to proceed if the test did not reach suspend. */
+		if (idst & SDXC_IDMAC_DESTINATION_INVALID)
+			mmc_writel(host, REG_IDST, SDXC_IDMAC_DESTINATION_INVALID);
+		desc->config |= SDXC_IDMAC_DES0_OWN;
+		wmb();
+		mmc_writel(host, REG_DMAC, mmc_readl(host, REG_DMAC) |
+			   SDXC_IDMAC_REFETCH_DES);
+		mmc_writel(host, REG_IDIE, idie);
+		mmc_writel(host, REG_IMASK, host->sdio_imask | host->dat3_imask |
+			   imask);
+		dev_info(mmc_dev(mmc),
+			 "sunxi dumper: DMA test did not suspend lba=%u idst=%08x\n",
+			 lba, idst);
+	}
+#endif
 
 	spin_unlock_irqrestore(&host->lock, iflags);
 }
