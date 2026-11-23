@@ -19,6 +19,11 @@
 #include <linux/interrupt.h>
 #include <linux/delay.h>
 #include <linux/err.h>
+#include <linux/string.h>
+#include <linux/atomic.h>
+#include <linux/mutex.h>
+#include <linux/rcupdate.h>
+#include <clocksource/arm_arch_timer.h>
 
 #include <linux/clk.h>
 #include <linux/clk/sunxi.h>
@@ -30,10 +35,6 @@
 #include <linux/dma-mapping.h>
 #include <linux/slab.h>
 #include <linux/reset.h>
-#include <linux/atomic.h>
-#include <linux/string.h>
-#include <linux/workqueue.h>
-#include <clocksource/arm_arch_timer.h>
 
 #include <linux/of_address.h>
 #include <linux/of_gpio.h>
@@ -47,7 +48,6 @@
 #include <linux/mmc/core.h>
 #include <linux/mmc/card.h>
 #include <linux/mmc/slot-gpio.h>
-#include <linux/mmc/sunxi-mmc-v1-panic.h>
 
 #include <linux/sys_config.h>
 
@@ -61,42 +61,112 @@
 #include "sunxi-mmc-debug.h"
 #include "sunxi-mmc-export.h"
 
+#include <linux/blkdev.h>
+#include <linux/cpumask.h>
+#include <linux/crc32.h>
+#include <linux/irqflags.h>
+#include <linux/kmsg_dump.h>
+#include <asm/byteorder.h>
+#include <linux/bio.h>
+#include <linux/workqueue.h>
+
 /**default retry times ****/
 #define SUNXI_DEF_RETRY_TIMES		6
 
-/* T3 sdc2/v4p5x: prepare normally, take over and write only in fatal panic. */
-#define SUNXI_PANIC_RETRY_MS	500U
+/*=============================T3 EMMC PANIC WRITE===============================================*/
 
-#define SUNXI_PANIC_R1_ERRORS \
-	(R1_OUT_OF_RANGE | R1_ADDRESS_ERROR | R1_BLOCK_LEN_ERROR | \
-	 R1_WP_VIOLATION | R1_CARD_IS_LOCKED | R1_COM_CRC_ERROR | \
-	 R1_ILLEGAL_COMMAND | R1_CARD_ECC_FAILED | R1_CC_ERROR | \
-	 R1_ERROR | R1_UNDERRUN | R1_OVERRUN | R1_SWITCH_ERROR)
+#define SUNXI_PSTORE_START_SECTOR     	15237120
+#define SUNXI_PSTORE_NR_SECTORS			32768
+#define SUNXI_PSTORE_SECTOR_SIZE		512
+#define SUNXI_PANIC_RETRY_MS			500
+#define SUNXI_PANIC_FIFO_OFF			0x200
+#define SUNXI_PANIC_THLD_OFF			0x100
+#define SUNXI_PANIC_STATUS_MS			10
+#define SUNXI_PANIC_RESET_MS			10
+#define SUNXI_PANIC_DRAIN_MS			500
+#define SUNXI_PANIC_CARD_READY_MS		1000
+#define SUNXI_PANIC_TOTAL_MS			3000
+#define SUNXI_PANIC_SECTOR_MS			500
+#define SUNXI_PANIC_READ_STOP_MS		100
+#define SUNXI_PANIC_WRITE_STOP_MS		1000
 
-enum sunxi_mmc_panic_write_state {
+#define SUNXI_PANIC_R1_ERRORS	\
+	(R1_OUT_OF_RANGE | R1_ADDRESS_ERROR | R1_BLOCK_LEN_ERROR | R1_WP_VIOLATION | R1_CARD_IS_LOCKED | \
+	 R1_COM_CRC_ERROR | R1_ILLEGAL_COMMAND | R1_CARD_ECC_FAILED | R1_CC_ERROR | R1_ERROR | R1_UNDERRUN | \
+	 R1_OVERRUN | R1_SWITCH_ERROR)
+
+#define SUNXI_PANIC_BUSY	(SDXC_CARD_DATA_BUSY | SDXC_DATA_FSM_BUSY)
+
+#define SUNXI_PANIC_DATA_TIMEOUT_UNIT	BIT(11)
+#define SUNXI_PANIC_CMD_TIMEOUT_UNIT	BIT(12)
+
+/* STAS[7:4] 命令状态 */
+#define SUNXI_PANIC_CMD_FSM		GENMASK(7, 4)
+/* STAS[16:11] 最近一次响应的命令编号	*/
+#define SUNXI_PANIC_RESP_INDEX(status)	(((status) >> 11) & 0x3f)
+/* IDST[16:13] IDMAC 状态*/
+#define SUNXI_PANIC_DMA_STATE	GENMASK(16, 13)
+
+#define SUNXI_PANIC_CMD_ERRORS		(SDXC_RESP_ERROR | SDXC_RESP_TIMEOUT | SDXC_RESP_CRC_ERROR | SDXC_HARD_WARE_LOCKED)
+
+#define SUNXI_PANIC_DATA_EVENTS		(SDXC_DATA_OVER | SDXC_AUTO_COMMAND_DONE)
+
+#define SUNXI_PANIC_DMA_ERRORS	\
+	(SDXC_IDMAC_FATAL_BUS_ERROR | SDXC_IDMAC_DESTINATION_INVALID | \ 
+		SDXC_IDMAC_CARD_ERROR_SUM | SDXC_IDMAC_ABNORMAL_INTERRUPT_SUM)
+
+#define SUNXI_PANIC_DMA_DONE	\
+	(SDXC_IDMAC_RECEIVE_INTERRUPT | SDXC_IDMAC_TRANSMIT_INTERRUPT | SDXC_IDMAC_NORMAL_INTERRUPT_SUM)
+
+#define SUNXI_PANIC_LOG_MAGIC			0x434d4d50
+#define SUNXI_PANIC_LOG_VERSION			2
+#define SUNXI_PANIC_LOG_WRITING			1
+#define SUNXI_PANIC_LOG_COMMITTED		2
+#define SUNXI_PANIC_LOG_PAYLOAD_MAX		(128 * 1024)
+#define SUNXI_PANIC_LOG_OPEN_MODE		(FMODE_READ | FMODE_EXCL)
+#define SUNXI_MMC_LOG_PARTNO			4
+#define SUNXI_PANIC_LOG_SLOTS			64
+#define SUNXI_PANIC_LOG_SLOT_SECTORS	(SUNXI_PSTORE_NR_SECTORS / SUNXI_PANIC_LOG_SLOTS)
+
+enum sunxi_mmc_panic_context_state {
 	UNPREPARED,
 	READY,
 	PAUSED,
 	STOPPED,
 };
 
+static const u16 sunxi_mmc_panic_link_regs[] = {
+	SDXC_REG_WIDTH,		/* 数据总线宽度 */
+	SDXC_REG_TMOUT,		/* 命令响应和数据超时配置 */
+	SDXC_REG_FTRGL,		/* FIFO 和 DMA 大小配置 */
+	SDXC_REG_CSDC,		/* CRC状态检测配置 */
+	SDXC_REG_EDSD,		/* DDR数据起始位检测配置 */
+	SDXC_REG_DRV_DL,	/* 驱动延时配置*/
+	SDXC_REG_SAMP_DL,	/* 采样延时配置 */
+	SDXC_REG_DS_DL,		/* 数据选通延时配置 */
+};
+
 struct sunxi_mmc_panic_context {
 	struct sunxi_mmc_host *host;
 	struct mmc_card *card;
 	u32 timer_hz;
+	u32 link_gctrl;
+	u32 link_clkcr;
+	u32 link_regs[ARRAY_SIZE(sunxi_mmc_panic_link_regs)];
+	u64 started;
 	atomic_t writing;
 	bool taken_over;
 
 	struct delayed_work work;
-	enum sunxi_mmc_panic_write_state state;
+	enum sunxi_mmc_panic_context_state state;
 };
 
 static struct sunxi_mmc_panic_context sunxi_mmc_panic_ctx = {
 	.state = STOPPED,
 };
+
 static DEFINE_SPINLOCK(sunxi_mmc_panic_lock);
 
-/* Called by the worker, or after its synchronous cancellation, with state invalid. */
 static void sunxi_mmc_panic_clean(void)
 {
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
@@ -115,42 +185,37 @@ static int sunxi_mmc_panic_match_card(struct device *dev, void *data)
 	return dev->bus && !strcmp(dev->bus->name, "mmc");
 }
 
-/* The worker holds the card reference, host claim and clock reference. */
 static int sunxi_mmc_panic_prepare_card(struct mmc_card *card)
 {
 	struct mmc_host *mmc = card->host;
 	struct mmc_command cmd = { 0 };
 	int ret;
 
-	if (card != mmc->card || mmc_card_removed(card))
+	if (card != mmc->card || mmc_card_removed(card)) 
 		return -ENODEV;
-	if (mmc->ios.power_mode != MMC_POWER_ON || !mmc->ios.clock)
+	if (mmc->ios.power_mode != MMC_POWER_ON || !mmc->ios.clock) 
 		return -EHOSTDOWN;
-	if (!mmc_card_mmc(card) || !mmc_card_blockaddr(card) ||
-	    card->ext_csd.data_sector_size != SUNXI_PSTORE_SECTOR_SIZE ||
-	    (card->ext_csd.part_config & EXT_CSD_PART_CONFIG_ACC_MASK) ||
-	    (card->ext_csd.cache_ctrl & 1) ||
-	    mmc->ios.timing != MMC_TIMING_MMC_HS)
+	if (!mmc_card_blockaddr(card)|| 
+		card->ext_csd.data_sector_size != SUNXI_PSTORE_SECTOR_SIZE ||
+		(card->ext_csd.part_config & EXT_CSD_PART_CONFIG_ACC_MASK) || 
+		(card->ext_csd.cache_ctrl & 1))
 		return -EOPNOTSUPP;
-	if (card->ext_csd.sectors <
-	    SUNXI_PSTORE_START_SECTOR + SUNXI_PSTORE_NR_SECTORS)
+	if (card->ext_csd.sectors <= SUNXI_PSTORE_START_SECTOR ||
+		card->ext_csd.sectors - SUNXI_PSTORE_START_SECTOR < SUNXI_PSTORE_NR_SECTORS)
 		return -ERANGE;
-
-	/* CMD13 checks readiness without writing to the log area. */
 	cmd.opcode = MMC_SEND_STATUS;
 	cmd.arg = (u32)card->rca << 16;
 	cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
 	ret = mmc_wait_for_cmd(mmc, &cmd, 0);
-	if (ret)
+	if (ret) 
 		return ret;
-	if ((cmd.resp[0] & SUNXI_PANIC_R1_ERRORS) ||
-	    !(cmd.resp[0] & R1_READY_FOR_DATA) ||
-	    R1_CURRENT_STATE(cmd.resp[0]) != R1_STATE_TRAN)
+	if (!(cmd.resp[0] & R1_READY_FOR_DATA) || (cmd.resp[0] & SUNXI_PANIC_R1_ERRORS) ||
+		R1_CURRENT_STATE(cmd.resp[0]) != R1_STATE_TRAN) 
 		return -EIO;
-
 	return 0;
 }
 
+//
 static void sunxi_mmc_panic_prepare_work(struct work_struct *work)
 {
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
@@ -159,6 +224,7 @@ static void sunxi_mmc_panic_prepare_work(struct work_struct *work)
 	struct mmc_card *card;
 	unsigned long flags;
 	u32 timer_hz;
+	unsigned int i;
 	int ret;
 
 	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
@@ -168,108 +234,94 @@ static void sunxi_mmc_panic_prepare_work(struct work_struct *work)
 	}
 	mmc = ctx->host->mmc;
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
-
 	sunxi_mmc_panic_clean();
 	timer_hz = arch_timer_get_rate();
 	if (!timer_hz) {
 		dev_warn(mmc_dev(mmc), "panic prepare needs the ARM arch timer\n");
 		return;
 	}
-	/* Cards are children of class_dev; device_find_child takes a reference. */
-	card_dev = device_find_child(mmc_classdev(mmc), NULL,
-				    sunxi_mmc_panic_match_card);
+	card_dev = device_find_child(mmc_classdev(mmc), NULL, sunxi_mmc_panic_match_card);
 	if (!card_dev)
 		goto retry;
 	card = mmc_dev_to_card(card_dev);
 	mmc_claim_host(mmc);
 	mmc_host_clk_hold(mmc);
-
 	ret = sunxi_mmc_panic_prepare_card(card);
 	if (ret)
 		goto release;
-
 	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
-	/* Suspend/remove can start while the worker waits for CMD13. */
 	if (ctx->state != UNPREPARED) {
 		spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
 		goto release;
 	}
 	ctx->card = card;
 	ctx->timer_hz = timer_hz;
+	/* 保存当前host配置，复位时使用 */
+	ctx->link_gctrl = mmc_readl(ctx->host, REG_GCTRL) & (SDXC_DDR_MODE | SUNXI_PANIC_DATA_TIMEOUT_UNIT | SUNXI_PANIC_CMD_TIMEOUT_UNIT);
+	ctx->link_clkcr = mmc_readl(ctx->host, REG_CLKCR) & ~(SDXC_LOW_POWER_ON | SDXC_MASK_DATA0);
+	for (i = 0; i < ARRAY_SIZE(sunxi_mmc_panic_link_regs); i++)
+		ctx->link_regs[i] = readl(ctx->host->reg_base + sunxi_mmc_panic_link_regs[i]);
 	atomic_set(&ctx->writing, 0);
 	ctx->taken_over = false;
-	/* A panic reader checks READY, then smp_rmb(), before using fields. */
 	smp_wmb();
 	ctx->state = READY;
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
-
-	/* Keep the card and clock references until unprepare. */
 	mmc_release_host(mmc);
-	dev_info(mmc_dev(mmc), "panic context ready\n");
+	dev_info(mmc_dev(mmc), "sunxi_mmc_panic_prepare done\n");
 	return;
-
 release:
 	mmc_host_clk_release(mmc);
 	mmc_release_host(mmc);
 	put_device(card_dev);
-
 retry:
 	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
 	if (ctx->state == UNPREPARED)
-		schedule_delayed_work(&ctx->work,
-				     msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+		schedule_delayed_work(&ctx->work, msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
 }
 
-/* Called once by the target controller's probe; T3 uses CONFIG_ARM_ARCH_TIMER. */
 static void sunxi_mmc_panic_prepare(struct sunxi_mmc_host *host)
 {
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
 	unsigned long flags;
-
 	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
 	ctx->host = host;
 	ctx->state = UNPREPARED;
 	INIT_DELAYED_WORK(&ctx->work, sunxi_mmc_panic_prepare_work);
-	schedule_delayed_work(&ctx->work,
-			     msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+	schedule_delayed_work(&ctx->work, msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
 }
 
-/* Called before changing the card/bus configuration, under the host claim. */
-static void sunxi_mmc_panic_invalidate(struct sunxi_mmc_host *host)
+static void sunxi_mmc_panic_invalidate(struct sunxi_mmc_host *host, const char *caller, u32 arg)
 {
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
 	unsigned long flags;
-
+	bool invalidated = false;
 	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
-	if (ctx->host == host && ctx->state == READY) {
+	if (ctx->host == host && ctx->state == READY){
 		ctx->state = UNPREPARED;
-		/* Make invalidation visible before the following hardware changes. */
 		smp_mb();
 		schedule_delayed_work(&ctx->work, msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+		invalidated = true;
 	}
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
+	if (invalidated) {
+		dev_info(mmc_dev(host->mmc), "panic prepare invalidated by %s arg=0x%08x\n", caller, arg);
+	}
 }
 
-/* Normal context, without a host claim. Only PAUSED or STOPPED is passed. */
-static void sunxi_mmc_panic_cancel(struct sunxi_mmc_host *host,
-				   enum sunxi_mmc_panic_write_state state)
+static void sunxi_mmc_panic_cancel(struct sunxi_mmc_host *host, enum sunxi_mmc_panic_context_state state)
 {
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
 	unsigned long flags;
-
 	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
 	if (ctx->host != host) {
 		spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
 		return;
 	}
 	ctx->state = state;
-	/* Invalidate before references are dropped or the device is powered off. */
 	smp_mb();
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
-
-	/* Forbid requeue/publication first; wait and drop references outside lock. */
 	cancel_delayed_work_sync(&ctx->work);
 	sunxi_mmc_panic_clean();
 	if (state == STOPPED) {
@@ -279,96 +331,70 @@ static void sunxi_mmc_panic_cancel(struct sunxi_mmc_host *host,
 	}
 }
 
-#ifdef CONFIG_PM
 static void sunxi_mmc_panic_resume(struct sunxi_mmc_host *host)
 {
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
 	unsigned long flags;
-
 	spin_lock_irqsave(&sunxi_mmc_panic_lock, flags);
-	if (ctx->host == host) {
+	if (ctx->host == host){
 		ctx->state = UNPREPARED;
-		schedule_delayed_work(&ctx->work,
-				     msecs_to_jiffies(SUNXI_PANIC_RETRY_MS));
+		schedule_delayed_work(&ctx->work, 0);
 	}
 	spin_unlock_irqrestore(&sunxi_mmc_panic_lock, flags);
 }
-#endif
 
-#ifdef CONFIG_ARM_ARCH_TIMER
-#define SUNXI_PANIC_FIFO_OFF	0x200
-#define SUNXI_PANIC_THLD_OFF	0x100
-#define SUNXI_PANIC_STATUS_MS	10U
-#define SUNXI_PANIC_RESET_MS	10U
-#define SUNXI_PANIC_PENDING_MS	500U
-#define SUNXI_PANIC_SECTOR_MS	500U
-#define SUNXI_PANIC_READ_STOP_MS	100U
-#define SUNXI_PANIC_WRITE_STOP_MS	1000U
-#define SUNXI_PANIC_BUSY \
-	(SDXC_CARD_DATA_BUSY | SDXC_DATA_FSM_BUSY)
-#define SUNXI_PANIC_DMA_STATE	(0xfU << 13)
-#define SUNXI_PANIC_DMA_ERRORS \
-	(SDXC_IDMAC_FATAL_BUS_ERROR | SDXC_IDMAC_DESTINATION_INVALID | \
-	 SDXC_IDMAC_CARD_ERROR_SUM | SDXC_IDMAC_ABNORMAL_INTERRUPT_SUM | \
-	 SDXC_IDMAC_HOST_ABORT_INTERRUPT)
-#define SUNXI_PANIC_DMA_DONE \
-	(SDXC_IDMAC_RECEIVE_INTERRUPT | SDXC_IDMAC_TRANSMIT_INTERRUPT | \
-	 SDXC_IDMAC_NORMAL_INTERRUPT_SUM)
-
-/* T3's free-running counter keeps advancing with IRQs disabled. */
-static bool sunxi_mmc_panic_expired(struct sunxi_mmc_panic_context *ctx,
-				  u64 start, unsigned int ms)
+static bool sunxi_mmc_panic_expired(struct sunxi_mmc_panic_context *ctx, u64 start, unsigned int ms)
 {
-	u64 budget = (u64)(ctx->timer_hz / 1000) * ms;
+	u64 now = arch_timer_read_counter();
+	u32 ticks_per_ms = ctx->timer_hz / 1000;
 
-	return arch_timer_read_counter() - start >= budget;
+	return now - start >= (u64)ticks_per_ms * ms || now - ctx->started >= (u64)ticks_per_ms * SUNXI_PANIC_TOTAL_MS;
 }
 
-static int sunxi_mmc_panic_error(u32 raw, u32 idst)
+static int sunxi_mmc_panic_error(u32 raw)
 {
 	if (raw & (SDXC_RESP_TIMEOUT | SDXC_DATA_TIMEOUT))
 		return -ETIMEDOUT;
 	if (raw & (SDXC_RESP_CRC_ERROR | SDXC_DATA_CRC_ERROR))
 		return -EILSEQ;
-	if ((raw & SDXC_INTERRUPT_ERROR_BIT) ||
-	    (idst & SUNXI_PANIC_DMA_ERRORS))
+	if (raw & SDXC_INTERRUPT_ERROR_BIT)
 		return -EIO;
 	return 0;
 }
 
-/* Used only while observing the old request, before starting a new command. */
-static u32 sunxi_mmc_panic_pending_raw(struct sunxi_mmc_host *host)
+static bool sunxi_mmc_panic_cmd_idle(u32 cmd, u32 status)
 {
-	return mmc_readl(host, REG_RINTR) | ACCESS_ONCE(host->int_sum);
+	return !(cmd & SDXC_START) && !(status & SUNXI_PANIC_CMD_FSM);
 }
 
-/* Caller has established idle hardware and acknowledged the previous command. */
-static int sunxi_mmc_panic_status(struct sunxi_mmc_panic_context *ctx)
+static void sunxi_mmc_panic_ack(struct sunxi_mmc_host *host)
+{
+	/* RINTR 写1 清除对应事件， 保留高位的卡插拔和SDIO通知 */
+	mmc_writel(host, REG_RINTR, mmc_readl(host, REG_RINTR) & 0xffff);
+}
+
+static int sunxi_mmc_panic_read_r1(struct sunxi_mmc_panic_context *ctx, u32 *r1)
 {
 	struct sunxi_mmc_host *host = ctx->host;
-	u32 raw, r1;
-	u64 start;
+	u64 start = arch_timer_read_counter();
+	u32 raw;
 	int ret;
 
+	if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_STATUS_MS))
+		return -ETIMEDOUT;
+	mmc_writel(host, REG_RINTR, SDXC_COMMAND_DONE | SUNXI_PANIC_CMD_ERRORS);
 	mmc_writel(host, REG_CARG, (u32)ctx->card->rca << 16);
-	/* Publish the argument before starting CMD13. */
 	wmb();
-	start = arch_timer_read_counter();
-	mmc_writel(host, REG_CMDR, SDXC_START | SDXC_RESP_EXPECT |
-		   SDXC_CHECK_RESPONSE_CRC | MMC_SEND_STATUS);
+	mmc_writel(host, REG_CMDR, SDXC_START | SDXC_RESP_EXPECT | SDXC_CHECK_RESPONSE_CRC | MMC_SEND_STATUS);
 	for (;;) {
 		raw = mmc_readl(host, REG_RINTR);
-		ret = sunxi_mmc_panic_error(raw, 0);
+		ret = sunxi_mmc_panic_error(raw & SUNXI_PANIC_CMD_ERRORS);
 		if (ret)
 			return ret;
 		if (raw & SDXC_COMMAND_DONE) {
-			r1 = mmc_readl(host, REG_RESP0);
-			mmc_writel(host, REG_RINTR, raw & 0xffff);
-			if (r1 & SUNXI_PANIC_R1_ERRORS)
-				return -EIO;
-			if (!(r1 & R1_READY_FOR_DATA) ||
-			    R1_CURRENT_STATE(r1) != R1_STATE_TRAN)
-				return -EBUSY;
+			if (SUNXI_PANIC_RESP_INDEX(mmc_readl(host, REG_STAS)) != MMC_SEND_STATUS)
+				return -EILSEQ;
+			*r1 = mmc_readl(host, REG_RESP0);
 			return 0;
 		}
 		if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_STATUS_MS))
@@ -377,156 +403,208 @@ static int sunxi_mmc_panic_status(struct sunxi_mmc_panic_context *ctx)
 	}
 }
 
-struct sunxi_mmc_panic_pending {
-	u32 raw;
-	u32 idst;
-	u32 status;
-	u32 done;
-	bool write;
-};
-
-static bool sunxi_mmc_panic_pending_done(struct sunxi_mmc_panic_pending *p)
+static bool sunxi_mmc_panic_card_ready(u32 r1)
 {
-	return (p->raw & p->done) == p->done &&
-		!(p->status & SUNXI_PANIC_BUSY) &&
-		(p->status & SDXC_FIFO_EMPTY) &&
-		!(p->idst & SUNXI_PANIC_DMA_STATE);
+	return R1_CURRENT_STATE(r1) == R1_STATE_TRAN && (r1 & R1_READY_FOR_DATA);
 }
 
-/* Only a software deadline returns -EAGAIN; hardware timeouts stay fatal. */
-static int sunxi_mmc_panic_wait_pending(struct sunxi_mmc_panic_context *ctx,
-				      struct sunxi_mmc_panic_pending *p)
+static int sunxi_mmc_panic_write_sector(struct sunxi_mmc_panic_context *ctx, u32 lba, const u8 *buf, size_t bytes)
 {
 	struct sunxi_mmc_host *host = ctx->host;
-	struct mmc_request *mrq = host->mrq;
-	u32 opcode;
+	u32 thld, raw, status, word, r1;
+	u32 done = SDXC_COMMAND_DONE | SDXC_DATA_OVER;
 	u64 start;
+	size_t offset;
+	unsigned int words = 0;
 	int ret;
 
-	/* Trust normal request setup; only restrict the transfer modes we support. */
-	if (!mrq->data || mrq->sbc || mrq->data->blksz != 512 ||
-	    (mrq->data->flags & MMC_DATA_STREAM))
-		return -EOPNOTSUPP;
-	opcode = mrq->cmd->opcode;
-	switch (opcode) {
-	case MMC_READ_SINGLE_BLOCK:
-	case MMC_READ_MULTIPLE_BLOCK:
-		p->write = false;
-		break;
-	case MMC_WRITE_BLOCK:
-	case MMC_WRITE_MULTIPLE_BLOCK:
-		p->write = true;
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
-	p->done = SDXC_COMMAND_DONE | SDXC_DATA_OVER;
-	if (mrq->data->stop)
-		p->done |= SDXC_AUTO_COMMAND_DONE;
 	start = arch_timer_read_counter();
+	if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_SECTOR_MS))
+		return -ETIMEDOUT;
+
+	//读取阈值寄存器并关闭卡侧读阈值功能，开启写阈值功能，并设置阈值为512字节
+	//让控制器等到FIFO中达到512字节阈值后再开始传输
+	thld = readl(host->reg_base + SUNXI_PANIC_THLD_OFF);
+	thld &= ~(0xfff << 16);
+	thld |= (512 << 16);
+	thld &= ~BIT(0);
+	thld |= BIT(2);
+	writel(thld, host->reg_base + SUNXI_PANIC_THLD_OFF);
+	mmc_writel(host, REG_BLKSZ, 512);
+	mmc_writel(host, REG_BCNTR, 512);
+	mmc_writel(host, REG_CARG, lba);
+	wmb();
+	start = arch_timer_read_counter();
+	mmc_writel(host, REG_CMDR, SDXC_START | SDXC_RESP_EXPECT | SDXC_CHECK_RESPONSE_CRC |
+					 SDXC_DATA_EXPECT | SDXC_WRITE | SDXC_WAIT_PRE_OVER | MMC_WRITE_BLOCK);
 	for (;;) {
-		p->raw = sunxi_mmc_panic_pending_raw(host);
-		p->idst = mmc_readl(host, REG_IDST);
-		p->status = mmc_readl(host, REG_STAS);
-		ret = sunxi_mmc_panic_error(p->raw, p->idst);
+		raw = mmc_readl(host, REG_RINTR);
+		ret = sunxi_mmc_panic_error(raw);
 		if (ret)
 			return ret;
-		if ((p->raw & SDXC_COMMAND_DONE) &&
-		    (mmc_readl(host, REG_RESP0) & SUNXI_PANIC_R1_ERRORS))
+		if ((raw & SDXC_COMMAND_DONE) && (mmc_readl(host, REG_RESP0) & SUNXI_PANIC_R1_ERRORS))
 			return -EIO;
-		if (sunxi_mmc_panic_pending_done(p))
-			return 0;
-		if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_PENDING_MS))
-			return -EAGAIN;
+		status = mmc_readl(host, REG_STAS);
+		if (words < 128){
+			offset = words * sizeof(word);
+			word = 0;
+			if (offset < bytes)
+				memcpy(&word, buf + offset, min_t(size_t, bytes - offset, sizeof(word)));
+			writel(word, host->reg_base + SUNXI_PANIC_FIFO_OFF);
+			words++;
+		}
+		if (words == 128 && (raw & done) == done && !(status & SUNXI_PANIC_BUSY) &&
+			(status & SDXC_FIFO_EMPTY) && sunxi_mmc_panic_cmd_idle(mmc_readl(host, REG_CMDR), status)) {
+			ret = sunxi_mmc_panic_read_r1(ctx, &r1);
+			if (ret)
+				return ret;
+			if (r1 & SUNXI_PANIC_R1_ERRORS)
+				return -EIO;
+			sunxi_mmc_panic_ack(host);
+			return sunxi_mmc_panic_card_ready(r1) ? 0 : -EBUSY;
+		}
+		if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_SECTOR_MS))
+			return -ETIMEDOUT;
 		cpu_relax();
 	}
 }
 
-static void sunxi_mmc_panic_disable_dma(struct sunxi_mmc_host *host)
+static int sunxi_mmc_panic_wait_clear(struct sunxi_mmc_panic_context *ctx, u32 reg, u32 mask)
 {
-	u32 gctrl;
-
-	mmc_writel(host, REG_DMAC, 0);
-	gctrl = mmc_readl(host, REG_GCTRL);
-	mmc_writel(host, REG_GCTRL, gctrl & ~SDXC_DMA_ENABLE_BIT);
-	mmc_readl(host, REG_GCTRL);
-}
-
-/* Reset DMA only. A late automatic STOP makes manual STOP unsafe to infer. */
-static int sunxi_mmc_panic_reset_dma(struct sunxi_mmc_panic_context *ctx)
-{
-	struct sunxi_mmc_host *host = ctx->host;
-	u32 gctrl, dmac, idst, raw;
-	u64 start;
-	unsigned int step;
-	bool ready;
-	int ret;
-
-	for (step = 0; step < 3; step++) {
-		raw = sunxi_mmc_panic_pending_raw(host);
-		ret = sunxi_mmc_panic_error(raw, mmc_readl(host, REG_IDST));
-		if (ret)
-			return ret;
-		if (raw & (SDXC_DATA_OVER | SDXC_AUTO_COMMAND_DONE))
-			return -EBUSY;
-		if (step == 0)
-			mmc_writel(host, REG_GCTRL,
-				   mmc_readl(host, REG_GCTRL) | SDXC_DMA_RESET);
-		else if (step == 1)
-			mmc_writel(host, REG_DMAC, SDXC_IDMAC_SOFT_RESET);
-		start = arch_timer_read_counter();
-		for (;;) {
-			gctrl = mmc_readl(host, REG_GCTRL);
-			dmac = mmc_readl(host, REG_DMAC);
-			idst = mmc_readl(host, REG_IDST);
-			raw = sunxi_mmc_panic_pending_raw(host);
-			ret = sunxi_mmc_panic_error(raw, idst);
-			if (ret)
-				return ret;
-			if (raw & (SDXC_DATA_OVER | SDXC_AUTO_COMMAND_DONE))
-				return -EBUSY;
-			if (step == 0)
-				ready = !(gctrl & SDXC_DMA_RESET);
-			else if (step == 1)
-				ready = !(dmac & SDXC_IDMAC_SOFT_RESET);
-			else
-				ready = !(idst & SUNXI_PANIC_DMA_STATE);
-			if (ready)
-				break;
-			if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_RESET_MS))
-				return -ETIMEDOUT;
-			cpu_relax();
-		}
+	u64 start = arch_timer_read_counter();
+	while (readl(ctx->host->reg_base + reg) & mask) {
+		if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_RESET_MS))
+			return -ETIMEDOUT;
+		cpu_relax();
 	}
 	return 0;
 }
 
-/* DMA is stopped. Drain reads while STOP takes effect; reset writes after busy. */
-static int sunxi_mmc_panic_stop(struct sunxi_mmc_panic_context *ctx, bool write)
+static int sunxi_mmc_panic_drain(struct sunxi_mmc_panic_context *ctx)
 {
 	struct sunxi_mmc_host *host = ctx->host;
-	u32 raw, status, gctrl;
+	u64 start = arch_timer_read_counter();
+	bool reset_pending, busy;
+	u32 cmd, status;
+
+	for (;;) {
+		/* 先等待遗留的host，FIFO, DMA 复位完成 */
+		reset_pending = (mmc_readl(host, REG_GCTRL) & SDXC_HARDWARE_RESET) || (mmc_readl(host, REG_DMAC) & SDXC_IDMAC_SOFT_RESET);
+		/* 等待命令和数据, DMA 空闲 */
+		cmd = mmc_readl(host, REG_CMDR);
+		status = mmc_readl(host, REG_STAS);
+		busy = !sunxi_mmc_panic_cmd_idle(cmd, status) || (status & SUNXI_PANIC_BUSY) || (mmc_readl(host, REG_IDST) & SUNXI_PANIC_DMA_STATE);
+		if (!reset_pending) {
+			/* 复位之后， 检查卡时钟是否还在 */
+			if (!(mmc_readl(host, REG_CLKCR) & SDXC_CARD_CLOCK_ON))
+				return -EHOSTDOWN;
+			/* 如果没有遗留的复位，且命令和数据空闲，则提前返回 */
+			if (!busy)
+				return 0;
+		}
+		/* 如果超时，但不是因为复位超时，而是资源BUSY超时，则由后续操作进行复位，释放资源 */
+		if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_DRAIN_MS))
+			return reset_pending ? -ETIMEDOUT : 0;
+		cpu_relax();
+	}
+}
+
+static int sunxi_mmc_panic_reset_dma(struct sunxi_mmc_panic_context *ctx, u32 gctrl)
+{
+	struct sunxi_mmc_host *host = ctx->host;
 	u64 start;
-	unsigned int i, timeout_ms = write ? SUNXI_PANIC_WRITE_STOP_MS :
-					   SUNXI_PANIC_READ_STOP_MS;
 	int ret;
 
-	raw = sunxi_mmc_panic_pending_raw(host);
-	ret = sunxi_mmc_panic_error(raw, mmc_readl(host, REG_IDST));
+	/* 关闭DMA之后，DMA仍忙，先复位DMA接口*/
+	mmc_writel(host, REG_GCTRL, gctrl | SDXC_DMA_RESET);
+	ret = sunxi_mmc_panic_wait_clear(ctx, SDXC_REG_GCTRL, SDXC_DMA_RESET);
 	if (ret)
 		return ret;
-	if (raw & (SDXC_DATA_OVER | SDXC_AUTO_COMMAND_DONE))
-		return -EBUSY;
-	mmc_writel(host, REG_RINTR, raw & 0xffff);
-	mmc_writel(host, REG_CARG, 0);
-	/* Acknowledge old events and publish the argument before CMD12. */
-	wmb();
+	
+	if (!(mmc_readl(host, REG_IDST) & SUNXI_PANIC_DMA_STATE))
+		return 0;
+	/* 复位DMA接口后，IDMAC仍然忙，需要进一步复位DMA控制器 */
 	start = arch_timer_read_counter();
-	mmc_writel(host, REG_CMDR, SDXC_START | SDXC_RESP_EXPECT |
-		   SDXC_CHECK_RESPONSE_CRC | SDXC_STOP_ABORT_CMD |
-		   MMC_STOP_TRANSMISSION);
+	mmc_writel(host, REG_DMAC, SDXC_IDMAC_SOFT_RESET);
+	while ((mmc_readl(host, REG_DMAC) & SDXC_IDMAC_SOFT_RESET) ||
+			(mmc_readl(host, REG_IDST) & SUNXI_PANIC_DMA_STATE)) {
+		if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_RESET_MS))
+			return -ETIMEDOUT;
+		cpu_relax();
+	}
+	return 0;
+}
+
+static int sunxi_mmc_panic_quiesce_dma(struct sunxi_mmc_panic_context *ctx)
+{
+	struct sunxi_mmc_host *host = ctx->host;
+	u32 gctrl;
+	int ret;
+	
+	mmc_writel(host, REG_DMAC, 0);
+	gctrl = mmc_readl(host, REG_GCTRL) & ~(SDXC_DMA_ENABLE_BIT | SDXC_INTERRUPT_ENABLE_BIT);
+	mmc_writel(host, REG_GCTRL, gctrl);
+	
+	if (mmc_readl(host, REG_IDST) & SUNXI_PANIC_DMA_STATE) {
+		ret = sunxi_mmc_panic_reset_dma(ctx, gctrl);
+		if (ret)
+			return ret;
+	}
+
+	if ((mmc_readl(host, REG_DMAC) & SDXC_IDMAC_IDMA_ON) || (mmc_readl(host, REG_GCTRL) & SDXC_DMA_ENABLE_BIT))
+		return -EBUSY;
+	mmc_writel(host, REG_GCTRL, gctrl | SDXC_ACCESS_BY_AHB);
+	mmc_writel(host, REG_IDST, mmc_readl(host, REG_IDST) & (SUNXI_PANIC_DMA_DONE | SUNXI_PANIC_DMA_ERRORS));
+	return 0;
+}
+
+static int sunxi_mmc_panic_wait_command(struct sunxi_mmc_panic_context *ctx, bool auto_stop, bool *auto_stop_timeout)
+{
+	struct sunxi_mmc_host *host = ctx->host;
+	u32 raw, status, cmd;
+	u64 start = arch_timer_read_counter();
+	
 	for (;;) {
-		/* A bounded batch lets the outer loop still check errors/deadline. */
+		bool pending;
+		bool expired = sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_STATUS_MS);
+		cmd = mmc_readl(host, REG_CMDR);
+		status = mmc_readl(host, REG_STAS);
+		raw = mmc_readl(host, REG_RINTR) | ACCESS_ONCE(host->int_sum);
+		/* 数据已发送完毕，但自动STOP未完成， 则等待自动STOP完成 */
+		pending = auto_stop && (raw & SUNXI_PANIC_DATA_EVENTS) == SDXC_DATA_OVER;
+		if (sunxi_mmc_panic_cmd_idle(cmd, status) && !pending)
+			return 0;
+		if (expired) {
+			*auto_stop_timeout = pending;
+			return -ETIMEDOUT;
+		}
+		cpu_relax();
+	}
+}
+
+static int sunxi_mmc_panic_stop(struct sunxi_mmc_panic_context *ctx, bool write, bool auto_stop, u32 data_events, bool *auto_stop_timeout)
+{
+	struct sunxi_mmc_host *host = ctx->host;
+	unsigned int timeout_ms = write ? SUNXI_PANIC_WRITE_STOP_MS : SUNXI_PANIC_READ_STOP_MS;
+	u64 start = arch_timer_read_counter();
+	u32 raw, status;
+	unsigned int i;
+	int ret;
+
+	ret = sunxi_mmc_panic_wait_command(ctx, auto_stop, auto_stop_timeout);
+	if (ret)
+		return ret;
+	if (sunxi_mmc_panic_expired(ctx, start, timeout_ms))
+		return -ETIMEDOUT;
+	if ((mmc_readl(host, REG_RINTR) & SUNXI_PANIC_DATA_EVENTS) != data_events)
+		return -EAGAIN;
+	
+	mmc_writel(host, REG_RINTR, SDXC_COMMAND_DONE | SUNXI_PANIC_CMD_ERRORS);
+	mmc_writel(host, REG_CARG, 0);
+	wmb();
+	mmc_writel(host, REG_CMDR, SDXC_START | SDXC_RESP_EXPECT | 
+					SDXC_CHECK_RESPONSE_CRC | SDXC_STOP_ABORT_CMD | MMC_STOP_TRANSMISSION);
+	for (;;) {
 		if (!write) {
 			for (i = 0; i < 16; i++) {
 				if (mmc_readl(host, REG_STAS) & SDXC_FIFO_EMPTY)
@@ -536,189 +614,181 @@ static int sunxi_mmc_panic_stop(struct sunxi_mmc_panic_context *ctx, bool write)
 		}
 		raw = mmc_readl(host, REG_RINTR);
 		status = mmc_readl(host, REG_STAS);
-		ret = sunxi_mmc_panic_error(raw, 0);
+		ret = sunxi_mmc_panic_error(raw & SUNXI_PANIC_CMD_ERRORS);
 		if (ret)
 			return ret;
-		if (raw & SDXC_COMMAND_DONE) {
-			if (mmc_readl(host, REG_RESP0) & SUNXI_PANIC_R1_ERRORS)
-				return -EIO;
-			if (!(status & SUNXI_PANIC_BUSY) &&
-			    (write || (status & SDXC_FIFO_EMPTY)))
-				break;
+		if ((raw & SDXC_COMMAND_DONE) && SUNXI_PANIC_RESP_INDEX(status) == MMC_STOP_TRANSMISSION &&
+			sunxi_mmc_panic_cmd_idle(mmc_readl(host, REG_CMDR), status)) {
+			sunxi_mmc_panic_ack(host);
+			return 0;
 		}
 		if (sunxi_mmc_panic_expired(ctx, start, timeout_ms))
 			return -ETIMEDOUT;
 		cpu_relax();
 	}
-	if (write) {
-		gctrl = mmc_readl(host, REG_GCTRL);
-		mmc_writel(host, REG_GCTRL, gctrl | SDXC_FIFO_RESET);
-		start = arch_timer_read_counter();
-		for (;;) {
-			raw = mmc_readl(host, REG_RINTR);
-			ret = sunxi_mmc_panic_error(raw, 0);
-			if (ret)
-				return ret;
-			if (!(mmc_readl(host, REG_GCTRL) & SDXC_FIFO_RESET))
+}
+
+static int sunxi_mmc_panic_recovery_card(struct sunxi_mmc_panic_context *ctx, bool *auto_stop_timeout)
+{
+	struct sunxi_mmc_host *host = ctx->host;
+	u64 start = arch_timer_read_counter();
+	bool auto_stop = mmc_readl(host, REG_CMDR) & SDXC_SEND_AUTO_STOP;
+	bool stopped = false;
+	u32 data_events, r1;
+	int ret;
+	*auto_stop_timeout = false;
+
+	do {
+		ret = sunxi_mmc_panic_wait_command(ctx, auto_stop, auto_stop_timeout);
+		if (ret)
+			return ret;
+		data_events = mmc_readl(host, REG_RINTR) & SUNXI_PANIC_DATA_EVENTS;
+		ret = sunxi_mmc_panic_read_r1(ctx, &r1);
+		if (ret)
+			return ret;
+		if (sunxi_mmc_panic_card_ready(r1) && 
+			!(r1 & SUNXI_PANIC_R1_ERRORS) &&
+			!(mmc_readl(host, REG_STAS) & SDXC_CARD_DATA_BUSY))
+			return 0;
+		
+		switch (R1_CURRENT_STATE(r1)) {
+			case R1_STATE_DATA:
+			case R1_STATE_RCV:
+				if (stopped) {
+					/* 已经发生STOP命令，等待STOP命令完成 */
+					udelay(10);
+					break;
+				}
+				ret = sunxi_mmc_panic_stop(ctx, R1_CURRENT_STATE(r1) == R1_STATE_RCV, auto_stop, data_events, auto_stop_timeout);
+				if (ret == -EAGAIN)
+					continue;
+				if (ret)
+					return ret;
+				stopped = true;
+				auto_stop = false;
+				start = arch_timer_read_counter();
 				break;
+			case R1_STATE_PRG:
+			case R1_STATE_TRAN:
+				udelay(10);
+				break;
+			default:
+				return -EHOSTDOWN;
+		}
+	} while (!sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_CARD_READY_MS));
+	return r1 & SUNXI_PANIC_R1_ERRORS ? -EIO : -EBUSY;
+}
+
+static int sunxi_mmc_panic_wait_host_idle(struct sunxi_mmc_panic_context *ctx)
+{
+	struct sunxi_mmc_host *host = ctx->host;
+	u32 status;
+	u64 start = arch_timer_read_counter();
+
+	do {
+		status = mmc_readl(host, REG_STAS);
+		if (!(status & SDXC_DATA_FSM_BUSY) && 
+			sunxi_mmc_panic_cmd_idle(mmc_readl(host, REG_CMDR), status))
+			return 0;
+		cpu_relax();
+	} while (!sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_RESET_MS));
+	
+	return -EHOSTDOWN;
+}
+
+static int sunxi_mmc_panic_restore_host(struct sunxi_mmc_panic_context *ctx)
+{
+	struct sunxi_mmc_host *host = ctx->host;
+	unsigned int i;
+	int ret;
+
+	if (sunxi_mmc_panic_expired(ctx, ctx->started, SUNXI_PANIC_TOTAL_MS))
+		return -ETIMEDOUT;
+	mmc_writel(host, REG_GCTRL, SDXC_HARDWARE_RESET);
+	ret = sunxi_mmc_panic_wait_clear(ctx, SDXC_REG_GCTRL, SDXC_HARDWARE_RESET);
+	if (ret)
+		return ret;
+	for (i = 0; i < ARRAY_SIZE(sunxi_mmc_panic_link_regs); i++) {
+		writel(ctx->link_regs[i], host->reg_base + sunxi_mmc_panic_link_regs[i]);
+	}
+	mmc_writel(host, REG_GCTRL, ctx->link_gctrl | SDXC_ACCESS_BY_AHB);
+	mmc_writel(host, REG_IMASK, 0);
+	mmc_writel(host, REG_IDIE, 0);
+
+	mmc_writel(host, REG_CLKCR, ctx->link_clkcr | SDXC_MASK_DATA0);
+	mmc_writel(host, REG_CMDR, SDXC_START | SDXC_UPCLK_ONLY | SDXC_WAIT_PRE_OVER);
+	ret = sunxi_mmc_panic_wait_clear(ctx, SDXC_REG_CMDR, SDXC_START);
+	mmc_writel(host, REG_CLKCR, ctx->link_clkcr);
+	sunxi_mmc_panic_ack(host);
+	return ret;
+}
+
+static int sunxi_mmc_panic_takeover(struct sunxi_mmc_panic_context *ctx)
+{
+	struct sunxi_mmc_host *host = ctx->host;
+	bool card_ready, auto_stop_timeout;
+	u32 status;
+	int ret;
+
+	if (ACCESS_ONCE(host->mrq_retry) || ACCESS_ONCE(host->manual_stop_mrq))
+		return -EBUSY;
+	/* 等待旧的操作完成 */
+	ret = sunxi_mmc_panic_drain(ctx);
+	if (ret)
+		return ret;
+	/* 禁用中断 */
+	mmc_writel(host, REG_IMASK, 0);
+	mmc_writel(host, REG_IDIE, 0);
+	/* 确认DMA状态，若忙，则进行复位，复位失败则退出 */
+	ret = sunxi_mmc_panic_quiesce_dma(ctx);
+	if (ret)
+		return ret;
+	/* 确认卡的状态 */
+	ret = sunxi_mmc_panic_recovery_card(ctx, &auto_stop_timeout);
+	card_ready = !ret;
+	if (card_ready)
+		/* 卡就绪了，则确认控制器状态 */
+		ret = sunxi_mmc_panic_wait_host_idle(ctx);
+	if (ret) {
+		status = mmc_readl(host, REG_STAS);
+		/* 如果卡未就绪，可能是卡有问题，也可能是命令通道有问题，
+			如果是卡的问题，就记录失败。
+			如果是通道有问题，或者是控制器有问题，尝试复位控制器*/
+		if (!auto_stop_timeout && sunxi_mmc_panic_cmd_idle(mmc_readl(host, REG_CMDR), status) && 
+			!(card_ready && (status & SDXC_DATA_FSM_BUSY)))
+			return ret;
+		/* 控制器忙时，尝试复位控制器 */
+		ret = sunxi_mmc_panic_restore_host(ctx);
+		if (ret)
+			return ret;
+		/* 重新确认卡的状态 */
+		ret = sunxi_mmc_panic_recovery_card(ctx, &auto_stop_timeout);
+		if (!ret)
+			ret = sunxi_mmc_panic_wait_host_idle(ctx);
+	}
+	if (ret)
+		return ret;
+	status = mmc_readl(host, REG_STAS);
+	if (status & SDXC_CARD_DATA_BUSY)
+		return -EBUSY;
+	
+	if (!(status & SDXC_FIFO_EMPTY)) {
+		u64 start = arch_timer_read_counter();
+		mmc_writel(host, REG_GCTRL, mmc_readl(host, REG_GCTRL) | SDXC_FIFO_RESET);
+		while ((mmc_readl(host, REG_GCTRL) & SDXC_FIFO_RESET) ||
+				!(mmc_readl(host, REG_STAS) & SDXC_FIFO_EMPTY)) {
 			if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_RESET_MS))
 				return -ETIMEDOUT;
 			cpu_relax();
 		}
 	}
-	mmc_writel(host, REG_RINTR, raw & 0xffff);
+	sunxi_mmc_panic_ack(host);
 	return 0;
 }
 
-/* CMD12 can stop CMD17/18/24/25; recheck natural completion after the deadline. */
-static int sunxi_mmc_panic_abort(struct sunxi_mmc_panic_context *ctx,
-			       struct sunxi_mmc_panic_pending *p)
+
+static int sunxi_mmc_panic_write(u32 sector, const void *buf, size_t bytes)
 {
-	struct sunxi_mmc_host *host = ctx->host;
-	int ret;
-
-	/* Recheck completion before changing DMA or issuing a manual STOP. */
-	p->raw = sunxi_mmc_panic_pending_raw(host);
-	p->idst = mmc_readl(host, REG_IDST);
-	p->status = mmc_readl(host, REG_STAS);
-	ret = sunxi_mmc_panic_error(p->raw, p->idst);
-	if (ret || sunxi_mmc_panic_pending_done(p))
-		return ret;
-	if (p->raw & (SDXC_DATA_OVER | SDXC_AUTO_COMMAND_DONE))
-		return -EBUSY;
-	if (!(p->raw & SDXC_COMMAND_DONE))
-		return -EBUSY;
-
-	sunxi_mmc_panic_disable_dma(host);
-	/* The old request no longer describes hardware once we start taking over. */
-	host->mrq = NULL;
-	host->int_sum = 0;
-	host->wait_dma = false;
-	ret = sunxi_mmc_panic_reset_dma(ctx);
-	if (ret)
-		return ret;
-	mmc_writel(host, REG_GCTRL,
-		   mmc_readl(host, REG_GCTRL) | SDXC_ACCESS_BY_AHB);
-	return sunxi_mmc_panic_stop(ctx, p->write);
-}
-
-/* First call, or a new attempt after failure; establish the write precondition. */
-static int sunxi_mmc_panic_takeover(struct sunxi_mmc_panic_context *ctx)
-{
-	struct sunxi_mmc_host *host = ctx->host;
-	struct sunxi_mmc_panic_pending pending;
-	u32 gctrl, idst, raw, status;
-	int ret;
-
-	/* These stages may have been interrupted halfway through register updates. */
-	if (spin_is_locked(&host->lock) || host->mrq_retry ||
-	    host->manual_stop_mrq)
-		return -EBUSY;
-	if (!(mmc_readl(host, REG_CLKCR) & SDXC_CARD_CLOCK_ON))
-		return -EHOSTDOWN;
-	gctrl = mmc_readl(host, REG_GCTRL);
-	if (gctrl & SDXC_HARDWARE_RESET)
-		return -EBUSY;
-	/* Mask notification, leaving DMA running until the old request finishes. */
-	mmc_writel(host, REG_IMASK, 0);
-	mmc_writel(host, REG_IDIE, 0);
-	mmc_writel(host, REG_GCTRL, gctrl & ~SDXC_INTERRUPT_ENABLE_BIT);
-	if (host->mrq) {
-		ret = sunxi_mmc_panic_wait_pending(ctx, &pending);
-		if (ret == -EAGAIN)
-			ret = sunxi_mmc_panic_abort(ctx, &pending);
-		if (ret)
-			return ret;
-		sunxi_mmc_panic_disable_dma(host);
-	}
-
-	/* Also catches DMA started by set_dat before host->mrq was published. */
-	gctrl = mmc_readl(host, REG_GCTRL);
-	idst = mmc_readl(host, REG_IDST);
-	raw = mmc_readl(host, REG_RINTR);
-	status = mmc_readl(host, REG_STAS);
-	if ((gctrl & SDXC_DMA_ENABLE_BIT) ||
-	    (mmc_readl(host, REG_DMAC) & SDXC_IDMAC_SOFT_RESET) ||
-	    (idst & SUNXI_PANIC_DMA_STATE) ||
-	    (mmc_readl(host, REG_CMDR) & SDXC_START) ||
-	    (status & SUNXI_PANIC_BUSY) || !(status & SDXC_FIFO_EMPTY)) {
-		ret = sunxi_mmc_panic_error(raw, idst);
-		return ret ? ret : -EBUSY;
-	}
-	/* Idle hardware can discard old events and answer a fresh CMD13. */
-	mmc_writel(host, REG_IDST,
-		   idst & (SUNXI_PANIC_DMA_DONE | SUNXI_PANIC_DMA_ERRORS));
-	mmc_writel(host, REG_RINTR, raw & 0xffff);
-	/* Fatal panic never resumes the normal request; don't reuse it on retry. */
-	host->mrq = NULL;
-	host->int_sum = 0;
-	host->wait_dma = false;
-	mmc_writel(host, REG_GCTRL, gctrl | SDXC_ACCESS_BY_AHB);
-	return sunxi_mmc_panic_status(ctx);
-}
-
-/* Write 1..512 payload bytes as one sector, zero-padding the unused bytes. */
-static int sunxi_mmc_panic_write_sector(struct sunxi_mmc_panic_context *ctx,
-				      u32 lba, const u8 *buf, size_t bytes)
-{
-	struct sunxi_mmc_host *host = ctx->host;
-	u32 thld, raw, status, word;
-	u32 done = SDXC_COMMAND_DONE | SDXC_DATA_OVER;
-	u64 start;
-	size_t offset;
-	unsigned int words = 0;
-	int ret;
-
-	/* v4p5x: collect a full 512-byte block before transmitting to the card. */
-	thld = readl(host->reg_base + SUNXI_PANIC_THLD_OFF);
-	thld &= ~(0xfffU << 16);
-	thld |= 512U << 16;
-	thld &= ~BIT(0);
-	thld |= BIT(2);
-	writel(thld, host->reg_base + SUNXI_PANIC_THLD_OFF);
-	mmc_writel(host, REG_BLKSZ, 512);
-	mmc_writel(host, REG_BCNTR, 512);
-	mmc_writel(host, REG_CARG, lba);
-	/* Publish the data setup and argument before starting CMD24. */
-	wmb();
-	start = arch_timer_read_counter();
-	mmc_writel(host, REG_CMDR, SDXC_START | SDXC_RESP_EXPECT |
-		   SDXC_CHECK_RESPONSE_CRC | SDXC_DATA_EXPECT | SDXC_WRITE |
-		   SDXC_WAIT_PRE_OVER | MMC_WRITE_BLOCK);
-	for (;;) {
-		raw = mmc_readl(host, REG_RINTR);
-		ret = sunxi_mmc_panic_error(raw, 0);
-		if (ret)
-			return ret;
-		if ((raw & SDXC_COMMAND_DONE) &&
-		    (mmc_readl(host, REG_RESP0) & SUNXI_PANIC_R1_ERRORS))
-			return -EIO;
-		status = mmc_readl(host, REG_STAS);
-		/* An empty 1024-byte FIFO has room for this entire 512-byte block. */
-		if (words < 128) {
-			offset = words * sizeof(word);
-			word = 0;
-			if (offset < bytes)
-				memcpy(&word, buf + offset,
-				       min_t(size_t, sizeof(word), bytes - offset));
-			writel(word, host->reg_base + SUNXI_PANIC_FIFO_OFF);
-			words++;
-		}
-		if (words == 128 && (raw & done) == done &&
-		    !(status & SUNXI_PANIC_BUSY)) {
-			mmc_writel(host, REG_RINTR, raw & 0xffff);
-			return sunxi_mmc_panic_status(ctx);
-		}
-		if (sunxi_mmc_panic_expired(ctx, start, SUNXI_PANIC_SECTOR_MS))
-			return -ETIMEDOUT;
-		cpu_relax();
-	}
-}
-#endif
-
-int sunxi_mmc_panic_write(u32 sector, const void *buf, size_t bytes)
-{
-#ifdef CONFIG_ARM_ARCH_TIMER
 	struct sunxi_mmc_panic_context *ctx = &sunxi_mmc_panic_ctx;
 	const u8 *data = buf;
 	size_t offset, sectors;
@@ -726,29 +796,26 @@ int sunxi_mmc_panic_write(u32 sector, const void *buf, size_t bytes)
 
 	if (!buf || !bytes)
 		return -EINVAL;
-	/* Round the sector count up without overflowing bytes + 511. */
-	sectors = bytes / SUNXI_PSTORE_SECTOR_SIZE +
-		  (bytes % SUNXI_PSTORE_SECTOR_SIZE != 0);
-	if (sector >= SUNXI_PSTORE_NR_SECTORS ||
-	    sectors > SUNXI_PSTORE_NR_SECTORS - sector)
+	sectors = bytes / SUNXI_PSTORE_SECTOR_SIZE + (bytes % SUNXI_PSTORE_SECTOR_SIZE != 0);
+	if (sector >= SUNXI_PSTORE_NR_SECTORS || sectors > SUNXI_PSTORE_NR_SECTORS - sector)
 		return -ERANGE;
 	if (ACCESS_ONCE(ctx->state) != READY)
 		return -ENODEV;
-	/* Pair with the worker's publication of the prepared context. */
+	
 	smp_rmb();
 	if (atomic_cmpxchg(&ctx->writing, 0, 1))
 		return -EBUSY;
 	if (!ctx->taken_over) {
+		ctx->started = arch_timer_read_counter();
 		ret = sunxi_mmc_panic_takeover(ctx);
 		if (ret)
 			goto failed;
 		ctx->taken_over = true;
 	}
 	for (offset = 0; offset < bytes; offset += SUNXI_PSTORE_SECTOR_SIZE) {
-		ret = sunxi_mmc_panic_write_sector(ctx,
-			SUNXI_PSTORE_START_SECTOR + sector + offset / 512,
-			data + offset,
-			min_t(size_t, SUNXI_PSTORE_SECTOR_SIZE, bytes - offset));
+		ret = sunxi_mmc_panic_write_sector(ctx, SUNXI_PSTORE_START_SECTOR + sector + 
+			offset / SUNXI_PSTORE_SECTOR_SIZE, data + offset, 
+			min_t(size_t, bytes - offset, SUNXI_PSTORE_SECTOR_SIZE));
 		if (ret)
 			goto failed;
 	}
@@ -756,15 +823,304 @@ int sunxi_mmc_panic_write(u32 sector, const void *buf, size_t bytes)
 failed:
 	ctx->taken_over = false;
 out:
-	/* Publish takeover state before the next sequential call can enter. */
 	smp_mb();
 	atomic_set(&ctx->writing, 0);
 	return ret;
-#else
-	return -EOPNOTSUPP;
-#endif
 }
 EXPORT_SYMBOL_GPL(sunxi_mmc_panic_write);
+
+bool sunxi_mmc_panic_target(struct mmc_host *mmc);
+
+/*===============================================================================================*/
+
+/*=======================================DUMPER==================================================*/
+struct sunxi_panic_log_header {
+	__le32 magic;
+	__le32 version;
+	__le32 header_len;
+	__le32 state;
+	__le32 payload_len;
+	__le32 payload_crc;
+	__le32 header_crc;
+	__le32 seq;
+};
+
+static struct mmc_card *sunxi_panic_log_card;
+static struct block_device *sunxi_panic_log_partition;
+static u32 sunxi_panic_log_first_slot;
+static u32 sunxi_panic_log_first_seq;
+static atomic_t sunxi_panic_log_writes;
+static char sunxi_panic_log_payload[SUNXI_PANIC_LOG_PAYLOAD_MAX];
+static char sunxi_oops_log_payload[SUNXI_PANIC_LOG_PAYLOAD_MAX];
+static size_t sunxi_oops_log_len;
+static unsigned long sunxi_oops_log_busy;
+
+static u32 sunxi_panic_log_crc32(const void *data, size_t len)
+{
+	return crc32_le(~0, data, len) ^ ~0;
+}
+
+static int sunxi_panic_log_find_start(struct block_device *partition)
+{
+	u32 slot;
+	int latest_slot = -1;
+	u32 latest_seq = 0;
+	for (slot = 0; slot < SUNXI_PANIC_LOG_SLOTS; slot++) {
+		struct sunxi_panic_log_header header;
+		u32 sector = slot * SUNXI_PANIC_LOG_SLOT_SECTORS;
+		const void *data;
+		Sector page;
+		u32 crc;
+		u32 seq;
+		data = read_dev_sector(partition, sector, &page);
+		if (!data) {
+			printk(KERN_ERR "sunxi panic log: sector destoryed, can't read sector\n");
+			return -EIO;
+		}
+		memcpy(&header, data, sizeof(header));
+		put_dev_sector(page);
+		if (header.magic != cpu_to_le32(SUNXI_PANIC_LOG_MAGIC) || 
+			header.version != cpu_to_le32(SUNXI_PANIC_LOG_VERSION) ||
+			header.header_len != cpu_to_le32(sizeof(header)) || 
+			header.state != cpu_to_le32(SUNXI_PANIC_LOG_COMMITTED)) {
+			continue;
+		}
+		crc = le32_to_cpu(header.header_crc);
+		header.header_crc = 0;
+		if (crc != sunxi_panic_log_crc32(&header, sizeof(header))) {
+			continue;
+		}
+		seq = le32_to_cpu(header.seq);
+		if (latest_slot >= 0 && (s32)(seq - latest_seq) <= 0){
+			continue;
+		}
+		latest_seq = seq;
+		latest_slot = slot;
+	}
+	sunxi_panic_log_first_slot = (latest_slot + 1) % SUNXI_PANIC_LOG_SLOTS;
+	sunxi_panic_log_first_seq = latest_seq + 1;
+	atomic_set(&sunxi_panic_log_writes, 0);
+	printk(KERN_INFO "sunxi panic log: found start at slot %d, sequence %u\n", sunxi_panic_log_first_slot, sunxi_panic_log_first_seq);
+	return 0;
+}
+
+struct sunxi_oops_log_io {
+	struct page *page;
+	struct bio *bio;
+};
+
+static int sunxi_crash_log_write(struct sunxi_oops_log_io *io, u32 sector, const void *data, size_t len)
+{
+	const char *src = data;
+	struct bio *bio;
+	char *buf;
+	int ret;
+
+	if (!io)
+		return sunxi_mmc_panic_write(sector, data, len);
+	bio = io->bio;
+	buf = page_address(io->page);
+	while (len) {
+		size_t bytes = min_t(size_t, len, SUNXI_PSTORE_SECTOR_SIZE);
+		memcpy(buf, src, bytes);
+		memset(buf + bytes, 0, SUNXI_PSTORE_SECTOR_SIZE - bytes);
+		bio_reset(bio);
+		bio->bi_bdev = sunxi_panic_log_partition;
+		bio->bi_sector = sector++;
+		bio_add_page(bio, io->page, SUNXI_PSTORE_SECTOR_SIZE, 0);
+		ret = submit_bio_wait(WRITE, bio);
+		if (ret) 
+			return ret;
+		src += bytes;
+		len -= bytes;
+	}
+	return 0;
+}
+
+static void sunxi_panic_log_set_state(struct sunxi_panic_log_header *header, u32 state)
+{
+	u32 crc;
+
+	header->state = cpu_to_le32(state);
+	header->header_crc = 0;
+	crc = sunxi_panic_log_crc32(header, sizeof(*header));
+	header->header_crc = cpu_to_le32(crc);
+}
+
+static void sunxi_panic_log_write_record(const char *payload, size_t len, struct sunxi_oops_log_io *io)
+{
+	struct sunxi_panic_log_header header;
+	u32 index, slot, sector, seq;
+	int ret;
+
+	index = (u32)atomic_inc_return(&sunxi_panic_log_writes) - 1;
+	slot = (index + sunxi_panic_log_first_slot) % SUNXI_PANIC_LOG_SLOTS;
+	seq = sunxi_panic_log_first_seq + index;
+	sector = slot * SUNXI_PANIC_LOG_SLOT_SECTORS;
+
+	header.magic = cpu_to_le32(SUNXI_PANIC_LOG_MAGIC);
+	header.version = cpu_to_le32(SUNXI_PANIC_LOG_VERSION);
+	header.header_len = cpu_to_le32(sizeof(header));
+	header.payload_len = cpu_to_le32(len);
+	header.payload_crc = cpu_to_le32(sunxi_panic_log_crc32(payload, len));
+	header.seq = cpu_to_le32(seq);
+
+	sunxi_panic_log_set_state(&header, SUNXI_PANIC_LOG_WRITING);
+	ret = sunxi_crash_log_write(io, sector, &header, sizeof(header));
+	if (ret) {
+		pr_err("sunxi crash  log: failed to write header: %d\n", ret);
+		return;
+	}
+	ret = sunxi_crash_log_write(io, sector + 1, payload, len);
+	if (ret) {
+		pr_err("sunxi crash log: failed to write payload: %d\n", ret);
+		return;
+	}
+	sunxi_panic_log_set_state(&header, SUNXI_PANIC_LOG_COMMITTED);
+	ret = sunxi_crash_log_write(io, sector, &header, sizeof(header));
+	if (ret) {
+		pr_err("sunxi crash log: failed to update header state: %d\n", ret);
+		return;
+	}
+	pr_info("sunxi crash log: successfully written\n");
+}
+
+static void sunxi_oops_log_worker(struct work_struct *work)
+{
+	struct block_device *partition = sunxi_panic_log_partition;
+	struct sunxi_oops_log_io io;
+	
+	if (bdev_read_only(partition)) {
+		pr_err("sunxi crash log: partition is read-only\n");
+		goto unlock;
+	}
+	if (sunxi_panic_log_card->ext_csd.cache_ctrl) {
+		pr_err("sunxi crash log: oops write requires disabled eMMC cache\n");
+		goto unlock;
+	}
+
+	io.page = alloc_page(GFP_NOIO);
+	if (!io.page) {
+		pr_err("sunxi crash log: failed to allocate page\n");
+		goto unlock;
+	}
+	io.bio = bio_alloc(GFP_NOIO, 1);
+	sunxi_panic_log_write_record(sunxi_oops_log_payload, sunxi_oops_log_len, &io);
+	invalidate_bdev(partition);
+	bio_put(io.bio);
+	__free_page(io.page);
+unlock:
+	clear_bit_unlock(0, &sunxi_oops_log_busy);
+}
+
+static DECLARE_WORK(sunxi_oops_log_work, sunxi_oops_log_worker);
+
+static void sunxi_panic_log_dump(struct kmsg_dumper *dumper, enum kmsg_dump_reason reason)
+{
+	struct kmsg_dumper cursor = { .active = true };
+	char *payload;
+	size_t len;
+
+	if (reason != KMSG_DUMP_PANIC && reason != KMSG_DUMP_OOPS)
+		return;
+	if (reason == KMSG_DUMP_PANIC) {
+		if (!irqs_disabled() || num_online_cpus() != 1) {
+			pr_err("sunxi panic log: not dumping panic log\n");
+			return;
+		}
+		payload = sunxi_panic_log_payload;
+	} else {
+		if (test_and_set_bit_lock(0, &sunxi_oops_log_busy)) {
+			pr_err("sunxi panic log: oops log already in progress\n");
+			return;
+		}
+		payload = sunxi_oops_log_payload;
+	}
+	kmsg_dump_rewind(&cursor);
+	if (!kmsg_dump_get_buffer(&cursor, true, payload, SUNXI_PANIC_LOG_PAYLOAD_MAX, &len) || !len) {
+		if (reason == KMSG_DUMP_PANIC) {
+			pr_err("sunxi panic log: no panic log to dump\n");
+		} else {
+			clear_bit_unlock(0, &sunxi_oops_log_busy);
+		}
+		return;
+	}
+	if (reason == KMSG_DUMP_PANIC) {
+		sunxi_panic_log_write_record(sunxi_panic_log_payload, len, NULL);
+	} else {
+		sunxi_oops_log_len = len;
+		queue_work(system_freezable_wq, &sunxi_oops_log_work);
+	}
+}
+
+static struct kmsg_dumper sunxi_panic_log_dumper = {
+	.dump = sunxi_panic_log_dump,
+	.max_reason = KMSG_DUMP_OOPS,
+};
+
+void sunxi_mmc_panic_log_add(struct mmc_card *card, struct gendisk *disk)
+{
+	struct block_device *partition;
+	int ret;
+
+	if (!mmc_card_mmc(card) || !sunxi_mmc_panic_target(card->host)) {
+		printk(KERN_ERR "sunxi mmc panic log: unsupported card or target\n");
+		return;
+	}
+	partition = bdget_disk(disk, SUNXI_MMC_LOG_PARTNO);
+	if (!partition) {
+		dev_warn(&card->dev, "panic log partition %d missing\n", SUNXI_MMC_LOG_PARTNO);
+		return;
+	}
+	ret = blkdev_get(partition, SUNXI_PANIC_LOG_OPEN_MODE, &sunxi_panic_log_dumper);
+	if (ret) {
+		dev_err(&card->dev, "failed to open panic log partition: %d\n", ret);
+		return;
+	}
+	if (partition->bd_disk != disk || get_start_sect(partition) != SUNXI_PSTORE_START_SECTOR ||
+		part_nr_sects_read(partition->bd_part) != SUNXI_PSTORE_NR_SECTORS) {
+			dev_err(&card->dev, "panic log partition mismatch\n");
+			goto release;
+	}
+	if (bdev_logical_block_size(partition) != SUNXI_PSTORE_SECTOR_SIZE) {
+		dev_err(&card->dev, "panic log requires 512-byte sector\n");
+		goto release;
+	}
+	ret = sunxi_panic_log_find_start(partition);
+	if (ret) {
+		dev_err(&card->dev, "failed to find start sector for panic log: %d\n", ret);
+		goto release;
+	}
+	sunxi_panic_log_card = card;
+	sunxi_panic_log_partition = partition;
+	ret = kmsg_dump_register(&sunxi_panic_log_dumper);
+	if (ret) {
+		sunxi_panic_log_card = NULL;
+		sunxi_panic_log_partition = NULL;
+		goto release;
+	}
+	dev_info(&card->dev, "panic logger registered\n");
+	return;
+release:
+	blkdev_put(partition, SUNXI_PANIC_LOG_OPEN_MODE);
+}
+
+void sunxi_mmc_panic_log_remove(struct mmc_card *card)
+{
+	if (card != sunxi_panic_log_card)
+		return;
+	kmsg_dump_unregister(&sunxi_panic_log_dumper);
+	cancel_work_sync(&sunxi_oops_log_work);
+	clear_bit_unlock(0, &sunxi_oops_log_busy);
+	blkdev_put(sunxi_panic_log_partition, SUNXI_PANIC_LOG_OPEN_MODE);
+	sunxi_panic_log_card = NULL;
+	sunxi_panic_log_partition = NULL;
+	dev_info(&card->dev, "panic logger unregistered\n");
+}
+
+
+/*===============================================================================================*/
+
 
 static void sunxi_mmc_regs_save(struct sunxi_mmc_host *host);
 static void sunxi_mmc_regs_restore(struct sunxi_mmc_host *host);
@@ -1521,7 +1877,7 @@ static void sunxi_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 #if 0
     char *drv_type[] = { "B", "A", "C", "D" };
 #endif
-	sunxi_mmc_panic_invalidate(host);
+	sunxi_mmc_panic_invalidate(host, __func__, 0);
 	BUG_ON(ios->bus_mode >= sizeof(bus_mode) / sizeof(bus_mode[0]));
 	BUG_ON(ios->power_mode >= sizeof(pwr_mode) / sizeof(pwr_mode[0]));
 	BUG_ON(ios->timing >= sizeof(timing) / sizeof(timing[0]));
@@ -1707,8 +2063,7 @@ static void sunxi_mmc_enable_sdio_irq(struct mmc_host *mmc, int enable)
 static void sunxi_mmc_hw_reset(struct mmc_host *mmc)
 {
 	struct sunxi_mmc_host *host = mmc_priv(mmc);
-
-	sunxi_mmc_panic_invalidate(host);
+	sunxi_mmc_panic_invalidate(host, __func__, 0);
 	mmc_writel(host, REG_HWRST, 0);
 	udelay(10);
 	mmc_writel(host, REG_HWRST, 1);
@@ -1744,7 +2099,8 @@ static int sunxi_mmc_signal_voltage_switch(struct mmc_host *mmc,
 	}
 
 	if (!IS_ERR(vqmmc))
-		sunxi_mmc_panic_invalidate(mmc_priv(mmc));
+		sunxi_mmc_panic_invalidate(mmc_priv(mmc), __func__, 0);
+
 
 	switch (ios->signal_voltage) {
 	case MMC_SIGNAL_VOLTAGE_330:
@@ -1906,9 +2262,8 @@ static void sunxi_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	u32 cmd_val = 0;
 	int ret;
 
-	/* CMD6 can change the hardware partition before ext_csd is updated. */
 	if (cmd->opcode == MMC_SWITCH)
-		sunxi_mmc_panic_invalidate(host);
+		sunxi_mmc_panic_invalidate(host, __func__, cmd->arg);
 
 	/* Check for set_ios errors (should never happen) */
 	if (host->ferror) {
@@ -2082,13 +2437,11 @@ static struct mmc_host_ops sunxi_mmc_ops = {
 	.card_busy = sunxi_mmc_card_busy,
 };
 
-bool sunxi_mmc_v1_panic_target(struct mmc_host *mmc)
+bool sunxi_mmc_panic_target(struct mmc_host *mmc)
 {
 	struct sunxi_mmc_host *host = mmc_priv(mmc);
-
-	return mmc->ops == &sunxi_mmc_ops && host->phy_index == 2 &&
-	       of_device_is_compatible(mmc_dev(mmc)->of_node,
-				       "allwinner,sunxi-mmc-v4p5x");
+	return mmc->ops == &sunxi_mmc_ops && host->phy_index == 2 && 
+			of_device_is_compatible(mmc_dev(mmc)->of_node, "allwinner,sunxi-mmc-v4p5x");
 }
 
 #if defined(MMC_FPGA) && defined(CONFIG_ARCH_SUN8IW10P1)
@@ -2561,17 +2914,15 @@ static int sunxi_mmc_probe(struct platform_device *pdev)
 	ret = mmc_create_sys_fs(host, pdev);
 	if (ret) {
 		dev_err(&pdev->dev, "create sys fs failed\n");
-		goto error_remove_host;
+		goto error_free_dma;
 	}
 
 	dev_info(&pdev->dev, "base:0x%p irq:%u\n", host->reg_base, host->irq);
 	platform_set_drvdata(pdev, mmc);
-	if (sunxi_mmc_v1_panic_target(mmc))
+	if (sunxi_mmc_panic_target(mmc))
 		sunxi_mmc_panic_prepare(host);
 	return 0;
 
-      error_remove_host:
-	mmc_remove_host(mmc);
       error_free_dma:
 	dma_free_coherent(&pdev->dev, SUNXI_REQ_PAGE_SIZE, host->sg_cpu,
 			  host->sg_dma);
