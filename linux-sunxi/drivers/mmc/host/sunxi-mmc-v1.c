@@ -170,6 +170,7 @@ static DEFINE_SPINLOCK(sunxi_mmc_panic_lock);
 #ifdef CONFIG_DEBUG_FS
 static unsigned int panic_dma_test_lba;
 static unsigned int panic_host_test_lba;
+static unsigned int panic_auto_stop_test_lba;
 static struct mmc_request *sunxi_mmc_dma_test_mrq;
 module_param(panic_dma_test_lba, uint, 0600);
 MODULE_PARM_DESC(panic_dma_test_lba,
@@ -177,6 +178,9 @@ MODULE_PARM_DESC(panic_dma_test_lba,
 module_param(panic_host_test_lba, uint, 0600);
 MODULE_PARM_DESC(panic_host_test_lba,
 		 "One-shot panic test with CMD13 waiting on CMD25 data (0 disables)");
+module_param(panic_auto_stop_test_lba, uint, 0600);
+MODULE_PARM_DESC(panic_auto_stop_test_lba,
+		 "One-shot test dropping auto CMD12 completion at a crashlog LBA");
 #endif
 
 static void sunxi_mmc_panic_clean(void)
@@ -1614,6 +1618,50 @@ static irqreturn_t sunxi_mmc_finalize_request(struct sunxi_mmc_host *host)
 			|| host->mrq_retry) ? IRQ_WAKE_THREAD : IRQ_HANDLED;
 }
 
+#ifdef CONFIG_DEBUG_FS
+static void sunxi_mmc_auto_stop_test(struct sunxi_mmc_host *host,
+				     struct mmc_request *mrq)
+{
+	u32 lba = mrq->cmd->arg;
+	u32 cmdr, raw, raw_after;
+
+	if (mrq->cmd->opcode != MMC_WRITE_MULTIPLE_BLOCK || !mrq->data ||
+	    !(mrq->data->flags & MMC_DATA_WRITE) ||
+	    ACCESS_ONCE(panic_auto_stop_test_lba) != lba ||
+	    lba < SUNXI_PSTORE_START_SECTOR ||
+	    lba - SUNXI_PSTORE_START_SECTOR >= SUNXI_PSTORE_NR_SECTORS ||
+	    ACCESS_ONCE(sunxi_mmc_panic_ctx.state) != READY ||
+	    ACCESS_ONCE(sunxi_mmc_panic_ctx.host) != host)
+		return;
+
+	cmdr = mmc_readl(host, REG_CMDR);
+	raw = mmc_readl(host, REG_RINTR);
+	if (!(cmdr & SDXC_SEND_AUTO_STOP) ||
+	    (raw & SUNXI_PANIC_DATA_EVENTS) != SUNXI_PANIC_DATA_EVENTS ||
+	    ((raw | host->int_sum) & SDXC_INTERRUPT_ERROR_BIT) ||
+	    (host->int_sum & SDXC_AUTO_COMMAND_DONE) ||
+	    cmpxchg(&panic_auto_stop_test_lba, lba, 0U) != lba)
+		return;
+
+	/* Drop the latched auto-stop completion before the IRQ records it. */
+	mmc_writel(host, REG_RINTR, SDXC_AUTO_COMMAND_DONE);
+	raw_after = mmc_readl(host, REG_RINTR);
+	if ((raw_after & SUNXI_PANIC_DATA_EVENTS) != SDXC_DATA_OVER) {
+		/* The IRQ handler still has the original masked status. */
+		dev_warn(mmc_dev(host->mmc),
+			 "sunxi dumper: auto CMD12 test did not isolate DATA_OVER lba=%u rintr=%08x\n",
+			 lba, raw_after);
+		return;
+	}
+
+	mmc_writel(host, REG_IMASK, 0);
+	mmc_writel(host, REG_IDIE, 0);
+	spin_unlock(&host->lock);
+	panic("sunxi dumper: test auto CMD12 completion lost lba=%u cmdr=%08x rintr_before=%08x rintr_after=%08x",
+	      lba, cmdr, raw, raw_after);
+}
+#endif
+
 static irqreturn_t sunxi_mmc_irq(int irq, void *dev_id)
 {
 	struct sunxi_mmc_host *host = dev_id;
@@ -1646,6 +1694,11 @@ static irqreturn_t sunxi_mmc_irq(int irq, void *dev_id)
 
 	mrq = host->mrq;
 	if (mrq) {
+#ifdef CONFIG_DEBUG_FS
+		if ((msk_int & SDXC_AUTO_COMMAND_DONE) &&
+		    unlikely(ACCESS_ONCE(panic_auto_stop_test_lba)))
+			sunxi_mmc_auto_stop_test(host, mrq);
+#endif
 		if (idma_int & SDXC_IDMAC_RECEIVE_INTERRUPT)
 			host->wait_dma = false;
 
