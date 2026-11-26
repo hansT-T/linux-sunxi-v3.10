@@ -43,9 +43,9 @@
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
-#include <linux/mmc/sunxi-mmc-v1-panic.h>
 
 #include <asm/uaccess.h>
+#include "../host/sunxi-mmc.h"
 
 #include "queue.h"
 
@@ -61,7 +61,8 @@ MODULE_ALIAS("mmc:block");
 #define INAND_CMD38_ARG_SECERASE 0x80
 #define INAND_CMD38_ARG_SECTRIM1 0x81
 #define INAND_CMD38_ARG_SECTRIM2 0x88
-#define MMC_BLK_TIMEOUT_MS  (10 * 60 * 1000)        /* 10 minute timeout */
+/*实测10分钟之内复位 emmc还是故障，30秒之内复位可以解决问题*/
+#define MMC_BLK_TIMEOUT_MS  (30 * 1000)
 
 #define mmc_req_rel_wr(req)	((req->cmd_flags & REQ_FUA) && \
 				  (rq_data_dir(req) == WRITE))
@@ -929,6 +930,7 @@ static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
 {
 	struct mmc_blk_data *md = mq->data;
 	struct mmc_card *card = md->queue.card;
+	struct mmc_host *host = card->host;
 	unsigned int from, nr, arg;
 	int err = 0, type = MMC_BLK_DISCARD;
 
@@ -964,6 +966,7 @@ out:
 	if (!err)
 		mmc_blk_reset_success(md, type);
 	blk_end_request(req, err, blk_rq_bytes(req));
+	host->blk_err = err ? 1 : 0;
 
 	return err ? 0 : 1;
 }
@@ -973,6 +976,7 @@ static int mmc_blk_issue_secdiscard_rq(struct mmc_queue *mq,
 {
 	struct mmc_blk_data *md = mq->data;
 	struct mmc_card *card = md->queue.card;
+	struct mmc_host *host = card->host;
 	unsigned int from, nr, arg, trim_arg, erase_arg;
 	int err = 0, type = MMC_BLK_SECDISCARD;
 
@@ -1050,6 +1054,7 @@ out_retry:
 		mmc_blk_reset_success(md, type);
 out:
 	blk_end_request(req, err, blk_rq_bytes(req));
+	host->blk_err = err ? 1 : 0;
 
 	return err ? 0 : 1;
 }
@@ -1058,6 +1063,7 @@ static int mmc_blk_issue_flush(struct mmc_queue *mq, struct request *req)
 {
 	struct mmc_blk_data *md = mq->data;
 	struct mmc_card *card = md->queue.card;
+	struct mmc_host *host = card->host;
 	int ret = 0;
 
 	ret = mmc_flush_cache(card);
@@ -1065,6 +1071,7 @@ static int mmc_blk_issue_flush(struct mmc_queue *mq, struct request *req)
 		ret = -EIO;
 
 	blk_end_request_all(req, ret);
+	host->blk_err = ret ? 1 : 0;
 
 	return ret ? 0 : 1;
 }
@@ -1167,7 +1174,7 @@ static int mmc_blk_err_check(struct mmc_card *card,
 			if (err) {
 				pr_err("%s: error %d requesting status\n",
 				       req->rq_disk->disk_name, err);
-				return MMC_BLK_CMD_ERR;
+				return MMC_BLK_ABORT;
 			}
 
 			if (status & R1_ERROR) {
@@ -1417,10 +1424,7 @@ static void mmc_blk_rw_rq_prep(struct mmc_queue_req *mqrq,
 	mmc_set_data_timeout(&brq->data, card);
 
 	brq->data.sg = mqrq->sg;
-	if (mmc_card_mmc(card))
-		brq->data.sg_len = mmc_queue_map_sg(mq, mqrq);
-	else
-		brq->data.sg_len = sd_mmc_queue_map_sg(mq, mqrq);
+	brq->data.sg_len = mmc_queue_map_sg(mq, mqrq);
 
 	/*
 	 * Adjust the sg list so it is the same size as the
@@ -1647,10 +1651,7 @@ static void mmc_blk_packed_hdr_wrq_prep(struct mmc_queue_req *mqrq,
 	mmc_set_data_timeout(&brq->data, card);
 
 	brq->data.sg = mqrq->sg;
-	if (mmc_card_mmc(card))
-		brq->data.sg_len = mmc_queue_map_sg(mq, mqrq);
-	else
-		brq->data.sg_len = sd_mmc_queue_map_sg(mq, mqrq);
+	brq->data.sg_len = mmc_queue_map_sg(mq, mqrq);
 
 	mqrq->mmc_active.mrq = &brq->mrq;
 	mqrq->mmc_active.err_check = mmc_blk_packed_err_check;
@@ -1663,6 +1664,7 @@ static int mmc_blk_cmd_err(struct mmc_blk_data *md, struct mmc_card *card,
 			   int ret)
 {
 	struct mmc_queue_req *mq_rq;
+	struct mmc_host *host = card->host;
 	mq_rq = container_of(brq, struct mmc_queue_req, brq);
 
 	/*
@@ -1679,15 +1681,18 @@ static int mmc_blk_cmd_err(struct mmc_blk_data *md, struct mmc_card *card,
 		blocks = mmc_sd_num_wr_blocks(card);
 		if (blocks != (u32)-1) {
 			ret = blk_end_request(req, 0, blocks << 9);
+			host->blk_err = 0;
 		}
 	} else {
-		if (!mmc_packed_cmd(mq_rq->cmd_type))
+		if (!mmc_packed_cmd(mq_rq->cmd_type)) {
 			ret = blk_end_request(req, 0, brq->data.bytes_xfered);
+			host->blk_err = 0;
+		}
 	}
 	return ret;
 }
 
-static int mmc_blk_end_packed_req(struct mmc_queue_req *mq_rq)
+static int mmc_blk_end_packed_req(struct mmc_queue_req *mq_rq, struct mmc_host *host)
 {
 	struct request *prq;
 	struct mmc_packed *packed = mq_rq->packed;
@@ -1712,6 +1717,7 @@ static int mmc_blk_end_packed_req(struct mmc_queue_req *mq_rq)
 		}
 		list_del_init(&prq->queuelist);
 		blk_end_request(prq, 0, blk_rq_bytes(prq));
+		host->blk_err = 0;
 		i++;
 	}
 
@@ -1759,10 +1765,34 @@ static void mmc_blk_revert_packed_req(struct mmc_queue *mq,
 	mmc_blk_clear_packed(mq_rq);
 }
 
+
+/*
+ * 获取host的错误标志或硬复位计数
+ * flag - 1, 获取错误标志
+ * flag - 2, 获取硬复位计数
+ */
+int mmc_blk_get_host_err(const char *host_name, u8 flag)
+{
+	struct mmc_host *host = mmc_get_host_by_name(host_name);
+	if (host == NULL)
+		return 0;
+
+	switch (flag) {
+	case 1:
+		return host->blk_err;
+	case 2:
+		return host->hw_reset_cnt;
+	default:
+		return 0;
+	}
+}
+EXPORT_SYMBOL(mmc_blk_get_host_err);
+
 static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 {
 	struct mmc_blk_data *md = mq->data;
 	struct mmc_card *card = md->queue.card;
+	struct mmc_host *host = card->host;
 	struct mmc_blk_request *brq = &mq->mqrq_cur->brq;
 	int ret = 1, disable_multi = 0, retry = 0, type;
 	enum mmc_blk_status status;
@@ -1822,7 +1852,7 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 			mmc_blk_reset_success(md, type);
 
 			if (mmc_packed_cmd(mq_rq->cmd_type)) {
-				ret = mmc_blk_end_packed_req(mq_rq);
+				ret = mmc_blk_end_packed_req(mq_rq, host);
 				break;
 			} else {
 				ret = blk_end_request(req, 0,
@@ -1841,6 +1871,7 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 				rqc = NULL;
 				goto cmd_abort;
 			}
+			host->blk_err = 0;
 			break;
 		case MMC_BLK_CMD_ERR:
 			ret = mmc_blk_cmd_err(md, card, brq, req, ret);
@@ -1883,6 +1914,7 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 			 */
 			ret = blk_end_request(req, -EIO,
 						brq->data.blksz);
+			host->blk_err = 1;
 			if (!ret)
 				goto start_new_req;
 			break;
@@ -1927,12 +1959,14 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 			ret = blk_end_request(req, -EIO,
 					blk_rq_cur_bytes(req));
 	}
+	host->blk_err = 1;
 
  start_new_req:
 	if (rqc) {
 		if (mmc_card_removed(card)) {
 			rqc->cmd_flags |= REQ_QUIET;
 			blk_end_request_all(rqc, -EIO);
+			host->blk_err = 1;
 		} else {
 			/*
 			 * If current request is packed, it needs to put back.
@@ -1971,6 +2005,7 @@ static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
 	if (ret) {
 		if (req) {
 			blk_end_request_all(req, -EIO);
+			host->blk_err = 1;
 		}
 		ret = 0;
 		goto out;
@@ -2424,7 +2459,6 @@ static int mmc_blk_probe(struct mmc_card *card)
 static void mmc_blk_remove(struct mmc_card *card)
 {
 	struct mmc_blk_data *md = mmc_get_drvdata(card);
-
 	sunxi_mmc_panic_log_remove(card);
 	mmc_blk_remove_parts(card, md);
 	mmc_claim_host(card->host);
